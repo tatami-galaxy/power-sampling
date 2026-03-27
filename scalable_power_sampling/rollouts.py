@@ -3,6 +3,7 @@
 import torch
 from torch import Tensor
 from transformers import PreTrainedModel
+from transformers.cache_utils import Cache, DynamicCache
 
 
 @torch.no_grad()
@@ -108,9 +109,20 @@ def generate_rollouts(
 
 def _expand_kv_cache(past_key_values, n: int):
     """Repeat each KV-cache tensor n times along the batch dimension."""
+    if isinstance(past_key_values, Cache):
+        expanded_data = []
+        for layer_data in past_key_values:
+            keys, values = layer_data[0], layer_data[1]
+            entry = (keys.repeat_interleave(n, dim=0), values.repeat_interleave(n, dim=0))
+            # Preserve sliding window info if present
+            if len(layer_data) == 3 and layer_data[2] is not None:
+                entry = (*entry, layer_data[2])
+            expanded_data.append(entry)
+        return DynamicCache(ddp_cache_data=expanded_data)
+
+    # Legacy tuple-of-tuples format
     expanded = []
     for layer_past in past_key_values:
-        # Each layer_past is a tuple of (key, value), each shape (batch, heads, seq, dim)
         expanded.append(
             tuple(t.repeat_interleave(n, dim=0) for t in layer_past)
         )
@@ -119,6 +131,17 @@ def _expand_kv_cache(past_key_values, n: int):
 
 def _select_kv_cache(past_key_values, index: int):
     """Select a single batch element from a KV-cache."""
+    if isinstance(past_key_values, Cache):
+        selected_data = []
+        for layer_data in past_key_values:
+            keys, values = layer_data[0], layer_data[1]
+            entry = (keys[index : index + 1], values[index : index + 1])
+            if len(layer_data) == 3 and layer_data[2] is not None:
+                entry = (*entry, layer_data[2])
+            selected_data.append(entry)
+        return DynamicCache(ddp_cache_data=selected_data)
+
+    # Legacy tuple-of-tuples format
     selected = []
     for layer_past in past_key_values:
         selected.append(
