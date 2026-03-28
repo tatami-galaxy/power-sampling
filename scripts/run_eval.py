@@ -348,7 +348,7 @@ def evaluate_model_power_sampling(
         input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 
         sample_t0 = time.time()
-        out = sampler.generate(input_ids=input_ids, verbose=False)
+        out = sampler.generate(input_ids=input_ids, verbose=True)
         sample_elapsed = time.time() - sample_t0
 
         response = out["text"]
