@@ -110,12 +110,11 @@ def generate_rollouts(
 def _expand_kv_cache(past_key_values, n: int):
     """Repeat each KV-cache tensor n times along the batch dimension."""
     if isinstance(past_key_values, Cache):
-        cache = DynamicCache()
-        for layer_data in past_key_values:
-            keys, values = layer_data[0], layer_data[1]
-            cache.key_cache.append(keys.repeat_interleave(n, dim=0))
-            cache.value_cache.append(values.repeat_interleave(n, dim=0))
-        return cache
+        expanded_data = [
+            (keys.repeat_interleave(n, dim=0), values.repeat_interleave(n, dim=0))
+            for keys, values in past_key_values
+        ]
+        return DynamicCache(ddp_cache_data=expanded_data)
 
     # Legacy tuple-of-tuples format
     expanded = []
@@ -129,12 +128,11 @@ def _expand_kv_cache(past_key_values, n: int):
 def _select_kv_cache(past_key_values, index: int):
     """Select a single batch element from a KV-cache."""
     if isinstance(past_key_values, Cache):
-        cache = DynamicCache()
-        for layer_data in past_key_values:
-            keys, values = layer_data[0], layer_data[1]
-            cache.key_cache.append(keys[index : index + 1].clone())
-            cache.value_cache.append(values[index : index + 1].clone())
-        return cache
+        selected_data = [
+            (keys[index : index + 1].clone(), values[index : index + 1].clone())
+            for keys, values in past_key_values
+        ]
+        return DynamicCache(ddp_cache_data=selected_data)
 
     # Legacy tuple-of-tuples format
     selected = []
@@ -142,4 +140,20 @@ def _select_kv_cache(past_key_values, index: int):
         selected.append(
             tuple(t[index : index + 1] for t in layer_past)
         )
+    return type(past_key_values)(selected) if not isinstance(past_key_values, list) else selected
+
+
+def _batch_select_kv_cache(past_key_values, indices: Tensor):
+    """Select multiple batch elements from a KV-cache by index tensor."""
+    if isinstance(past_key_values, Cache):
+        selected_data = [
+            (keys[indices], values[indices])
+            for keys, values in past_key_values
+        ]
+        return DynamicCache(ddp_cache_data=selected_data)
+
+    # Legacy tuple-of-tuples format
+    selected = []
+    for layer_past in past_key_values:
+        selected.append(tuple(t[indices] for t in layer_past))
     return type(past_key_values)(selected) if not isinstance(past_key_values, list) else selected

@@ -195,7 +195,7 @@ def load_math500(levels: list[int] | None = None) -> list[dict]:
     ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
     out = []
     for row in ds:
-        level = int(row["level"])
+        level = int(str(row["level"]).removeprefix("Level "))
         if levels and level not in levels:
             continue
         out.append({
@@ -303,16 +303,22 @@ def evaluate_model_power_sampling(
     top_k: int = 8,
     num_rollouts: int = 8,
     lookahead: int = 32,
+    batched: bool = False,
+    batch_size: int = 8,
+    num_candidates: int = 32,
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
     from tqdm import tqdm
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from scalable_power_sampling import PowerSampler
+    from scalable_power_sampling import BatchedPowerSampler, PowerSampler
 
+    method = "batched_power_sampling" if batched else "power_sampling"
     print(f"\n{'='*60}")
-    print(f"Evaluating (power sampling): {model_name}")
+    print(f"Evaluating ({method}): {model_name}")
     print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
+    if batched:
+        print(f"  B={batch_size}, L={num_candidates}")
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
 
@@ -325,21 +331,34 @@ def evaluate_model_power_sampling(
         trust_remote_code=True,
     )
 
-    sampler = PowerSampler(
-        model=model,
-        tokenizer=tokenizer,
-        alpha=alpha,
-        top_k=top_k,
-        num_rollouts=num_rollouts,
-        lookahead=lookahead,
-        max_new_tokens=max_tokens,
-    )
+    if batched:
+        sampler = BatchedPowerSampler(
+            model=model,
+            tokenizer=tokenizer,
+            alpha=alpha,
+            batch_size=batch_size,
+            num_candidates=num_candidates,
+            top_k=top_k,
+            num_rollouts=num_rollouts,
+            lookahead=lookahead,
+            max_new_tokens=max_tokens,
+        )
+    else:
+        sampler = PowerSampler(
+            model=model,
+            tokenizer=tokenizer,
+            alpha=alpha,
+            top_k=top_k,
+            num_rollouts=num_rollouts,
+            lookahead=lookahead,
+            max_new_tokens=max_tokens,
+        )
 
     results = []
     t0 = time.time()
 
     correct_so_far = 0
-    pbar = tqdm(problems, desc="Power sampling", unit="problem")
+    pbar = tqdm(problems, desc=method, unit="problem")
     for i, prob in enumerate(pbar):
         messages = format_prompt(prob["problem"])
         prompt_text = tokenizer.apply_chat_template(
@@ -372,15 +391,20 @@ def evaluate_model_power_sampling(
         )
 
     elapsed = time.time() - t0
-    print(f"Power sampling took {elapsed:.1f}s total")
+    print(f"{method} took {elapsed:.1f}s total")
+
+    config = {
+        "alpha": alpha, "top_k": top_k,
+        "num_rollouts": num_rollouts, "lookahead": lookahead,
+    }
+    if batched:
+        config["batch_size"] = batch_size
+        config["num_candidates"] = num_candidates
 
     return {
         "model": model_name,
-        "method": "power_sampling",
-        "power_sampling_config": {
-            "alpha": alpha, "top_k": top_k,
-            "num_rollouts": num_rollouts, "lookahead": lookahead,
-        },
+        "method": method,
+        "power_sampling_config": config,
         "results": results,
         "elapsed_s": elapsed,
     }
@@ -527,6 +551,12 @@ def main():
                         help="Rollouts per candidate for power sampling")
     parser.add_argument("--lookahead", type=int, default=32,
                         help="Rollout horizon in tokens for power sampling")
+    parser.add_argument("--batched", action="store_true",
+                        help="Use batched power sampling (Algorithm 2) instead of single-token")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Tokens per chunk for batched power sampling (B)")
+    parser.add_argument("--num_candidates", type=int, default=32,
+                        help="Candidate chunks to generate per step for batched power sampling (L)")
 
     args = parser.parse_args()
 
@@ -571,9 +601,13 @@ def main():
                 top_k=args.top_k,
                 num_rollouts=args.num_rollouts,
                 lookahead=args.lookahead,
+                batched=args.batched,
+                batch_size=args.batch_size,
+                num_candidates=args.num_candidates,
             )
             print_report(ps_output)
-            ps_dir = output_dir + "/power_sampling"
+            method_name = "batched_power_sampling" if args.batched else "power_sampling"
+            ps_dir = output_dir + "/" + method_name
             save_results(ps_output, ps_dir)
 
 
