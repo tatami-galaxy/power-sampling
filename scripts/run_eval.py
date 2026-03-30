@@ -306,35 +306,34 @@ def evaluate_model_power_sampling(
     batched: bool = False,
     batch_size: int = 8,
     num_candidates: int = 32,
+    use_vllm: bool = False,
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 4096,
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
     from tqdm import tqdm
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from scalable_power_sampling import BatchedPowerSampler, PowerSampler
 
-    method = "batched_power_sampling" if batched else "power_sampling"
+    if use_vllm:
+        method = "vllm_batched_power_sampling"
+    elif batched:
+        method = "batched_power_sampling"
+    else:
+        method = "power_sampling"
+
     print(f"\n{'='*60}")
     print(f"Evaluating ({method}): {model_name}")
     print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
-    if batched:
+    if batched or use_vllm:
         print(f"  B={batch_size}, L={num_candidates}")
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    if use_vllm:
+        from scalable_power_sampling import VLLMBatchedPowerSampler
 
-    if batched:
-        sampler = BatchedPowerSampler(
-            model=model,
-            tokenizer=tokenizer,
+        sampler = VLLMBatchedPowerSampler(
+            model_name=model_name,
             alpha=alpha,
             batch_size=batch_size,
             num_candidates=num_candidates,
@@ -342,17 +341,45 @@ def evaluate_model_power_sampling(
             num_rollouts=num_rollouts,
             lookahead=lookahead,
             max_new_tokens=max_tokens,
+            tensor_parallel_size=tensor_parallel_size,
+            max_model_len=max_model_len,
         )
+        tokenizer = sampler.tokenizer
     else:
-        sampler = PowerSampler(
-            model=model,
-            tokenizer=tokenizer,
-            alpha=alpha,
-            top_k=top_k,
-            num_rollouts=num_rollouts,
-            lookahead=lookahead,
-            max_new_tokens=max_tokens,
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from scalable_power_sampling import BatchedPowerSampler, PowerSampler
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+            device_map=device,
+            trust_remote_code=True,
         )
+
+        if batched:
+            sampler = BatchedPowerSampler(
+                model=model,
+                tokenizer=tokenizer,
+                alpha=alpha,
+                batch_size=batch_size,
+                num_candidates=num_candidates,
+                top_k=top_k,
+                num_rollouts=num_rollouts,
+                lookahead=lookahead,
+                max_new_tokens=max_tokens,
+            )
+        else:
+            sampler = PowerSampler(
+                model=model,
+                tokenizer=tokenizer,
+                alpha=alpha,
+                top_k=top_k,
+                num_rollouts=num_rollouts,
+                lookahead=lookahead,
+                max_new_tokens=max_tokens,
+            )
 
     results = []
     t0 = time.time()
@@ -364,7 +391,12 @@ def evaluate_model_power_sampling(
         prompt_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
+
+        if use_vllm:
+            input_ids = tokenizer.encode(prompt_text)
+        else:
+            device = next(sampler.model.parameters()).device
+            input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 
         sample_t0 = time.time()
         out = sampler.generate(input_ids=input_ids, verbose=True)
@@ -397,7 +429,7 @@ def evaluate_model_power_sampling(
         "alpha": alpha, "top_k": top_k,
         "num_rollouts": num_rollouts, "lookahead": lookahead,
     }
-    if batched:
+    if batched or use_vllm:
         config["batch_size"] = batch_size
         config["num_candidates"] = num_candidates
 
@@ -557,6 +589,8 @@ def main():
                         help="Tokens per chunk for batched power sampling (B)")
     parser.add_argument("--num_candidates", type=int, default=32,
                         help="Candidate chunks to generate per step for batched power sampling (L)")
+    parser.add_argument("--use_vllm", action="store_true",
+                        help="Use vLLM backend for power sampling (much faster, implies --batched)")
 
     args = parser.parse_args()
 
@@ -604,10 +638,12 @@ def main():
                 batched=args.batched,
                 batch_size=args.batch_size,
                 num_candidates=args.num_candidates,
+                use_vllm=args.use_vllm,
+                tensor_parallel_size=args.tensor_parallel_size,
+                max_model_len=args.max_model_len or None,
             )
             print_report(ps_output)
-            method_name = "batched_power_sampling" if args.batched else "power_sampling"
-            ps_dir = output_dir + "/" + method_name
+            ps_dir = output_dir + "/" + ps_output["method"]
             save_results(ps_output, ps_dir)
 
 

@@ -1,9 +1,9 @@
 {
   "model": "Qwen/Qwen3-1.7B",
-  "method": "greedy",
+  "method": "batched_power_sampling",
   "dataset_size": 10,
-  "overall_accuracy": 0.3,
-  "elapsed_s": 21.77699851989746,
+  "overall_accuracy": 0.5,
+  "elapsed_s": 13940.216623067856,
   "by_level": {
     "2": {
       "correct": 1,
@@ -11,9 +11,9 @@
       "accuracy": 1.0
     },
     "3": {
-      "correct": 0,
+      "correct": 1,
       "total": 2,
-      "accuracy": 0.0
+      "accuracy": 0.5
     },
     "4": {
       "correct": 2,
@@ -21,9 +21,9 @@
       "accuracy": 0.5
     },
     "5": {
-      "correct": 0,
+      "correct": 1,
       "total": 3,
-      "accuracy": 0.0
+      "accuracy": 0.3333333333333333
     }
   },
   "by_subject": {
@@ -33,9 +33,9 @@
       "accuracy": 1.0
     },
     "Intermediate Algebra": {
-      "correct": 1,
+      "correct": 2,
       "total": 3,
-      "accuracy": 0.3333333333333333
+      "accuracy": 0.6666666666666666
     },
     "Number Theory": {
       "correct": 1,
@@ -43,10 +43,18 @@
       "accuracy": 0.25
     },
     "Prealgebra": {
-      "correct": 0,
+      "correct": 1,
       "total": 2,
-      "accuracy": 0.0
+      "accuracy": 0.5
     }
   },
-  "extraction_failures": 7
+  "extraction_failures": 5,
+  "power_sampling_config": {
+    "alpha": 4.0,
+    "top_k": 8,
+    "num_rollouts": 8,
+    "lookahead": 32,
+    "batch_size": 8,
+    "num_candidates": 32
+  }
 }
