@@ -309,6 +309,7 @@ def evaluate_model_power_sampling(
     use_vllm: bool = False,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
+    confidence_threshold: float | None = None,
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
@@ -326,6 +327,8 @@ def evaluate_model_power_sampling(
     print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
     if batched or use_vllm:
         print(f"  B={batch_size}, L={num_candidates}")
+    if confidence_threshold is not None:
+        print(f"  confidence_threshold={confidence_threshold}")
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
 
@@ -343,6 +346,7 @@ def evaluate_model_power_sampling(
             max_new_tokens=max_tokens,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
+            confidence_threshold=confidence_threshold,
         )
         tokenizer = sampler.tokenizer
     else:
@@ -432,6 +436,8 @@ def evaluate_model_power_sampling(
     if batched or use_vllm:
         config["batch_size"] = batch_size
         config["num_candidates"] = num_candidates
+    if confidence_threshold is not None:
+        config["confidence_threshold"] = confidence_threshold
 
     return {
         "model": model_name,
@@ -591,6 +597,8 @@ def main():
                         help="Candidate chunks to generate per step for batched power sampling (L)")
     parser.add_argument("--use_vllm", action="store_true",
                         help="Use vLLM backend for power sampling (much faster, implies --batched)")
+    parser.add_argument("--confidence_threshold", type=float, default=None,
+                        help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
 
     args = parser.parse_args()
 
@@ -641,6 +649,7 @@ def main():
                 use_vllm=args.use_vllm,
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len or None,
+                confidence_threshold=args.confidence_threshold,
             )
             print_report(ps_output)
             ps_dir = output_dir + "/" + ps_output["method"]

@@ -3,7 +3,7 @@
   "method": "vllm_batched_power_sampling",
   "dataset_size": 10,
   "overall_accuracy": 0.5,
-  "elapsed_s": 1502.9605951309204,
+  "elapsed_s": 312.5241665840149,
   "by_level": {
     "2": {
       "correct": 1,
@@ -53,8 +53,8 @@
     "alpha": 4.0,
     "top_k": 8,
     "num_rollouts": 8,
-    "lookahead": 32,
-    "batch_size": 8,
+    "lookahead": 16,
+    "batch_size": 64,
     "num_candidates": 32
   }
 }

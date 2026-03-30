@@ -41,6 +41,9 @@ class VLLMBatchedPowerSampler:
         tensor_parallel_size: GPUs for tensor parallelism. Default 1.
         max_model_len: Max context length for vLLM KV cache. Default 4096.
         dtype: Model dtype. Default "bfloat16".
+        confidence_threshold: If set, skip rollouts when the log-prob gap
+            between top-1 and top-2 candidates exceeds this value. Uses
+            low-temperature sampling instead. Default None (always run rollouts).
     """
 
     def __init__(
@@ -57,6 +60,7 @@ class VLLMBatchedPowerSampler:
         tensor_parallel_size: int = 1,
         max_model_len: int = 4096,
         dtype: str = "bfloat16",
+        confidence_threshold: float | None = None,
     ):
         self.alpha = alpha
         self.batch_size = batch_size
@@ -66,6 +70,7 @@ class VLLMBatchedPowerSampler:
         self.lookahead = lookahead
         self.max_new_tokens = max_new_tokens
         self.use_jackknife = use_jackknife
+        self.confidence_threshold = confidence_threshold
 
         self.llm = LLM(
             model=model_name,
@@ -124,9 +129,22 @@ class VLLMBatchedPowerSampler:
             top_k_chunks = [chunk_ids[i] for i in top_k_idx.tolist()]
             top_k_log_probs = top_k_vals  # (K,)
 
-            if self.alpha == 1.0:
+            # Check if we can skip rollouts due to high confidence
+            skip_rollouts = (
+                self.alpha == 1.0
+                or (
+                    self.confidence_threshold is not None
+                    and K >= 2
+                    and (top_k_log_probs[0] - top_k_log_probs[1]).item()
+                    > self.confidence_threshold
+                )
+            )
+
+            if skip_rollouts:
+                # Low-temperature sampling from candidates directly
+                log_unnorm = self.alpha * top_k_log_probs
                 probs = torch.exp(
-                    top_k_log_probs - torch.logsumexp(top_k_log_probs, dim=-1)
+                    log_unnorm - torch.logsumexp(log_unnorm, dim=-1)
                 )
                 idx = torch.multinomial(probs, 1).item()
             else:
@@ -311,5 +329,6 @@ class VLLMBatchedPowerSampler:
             f"batch_size={self.batch_size}, "
             f"num_candidates={self.num_candidates}, top_k={self.top_k}, "
             f"num_rollouts={self.num_rollouts}, lookahead={self.lookahead}, "
-            f"jackknife={self.use_jackknife})"
+            f"jackknife={self.use_jackknife}, "
+            f"confidence_threshold={self.confidence_threshold})"
         )

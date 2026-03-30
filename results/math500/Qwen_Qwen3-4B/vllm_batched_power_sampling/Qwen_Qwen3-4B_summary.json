@@ -1,9 +1,9 @@
 {
   "model": "Qwen/Qwen3-4B",
-  "method": "greedy",
+  "method": "vllm_batched_power_sampling",
   "dataset_size": 10,
   "overall_accuracy": 0.4,
-  "elapsed_s": 31.40405535697937,
+  "elapsed_s": 2152.6333746910095,
   "by_level": {
     "2": {
       "correct": 1,
@@ -48,5 +48,13 @@
       "accuracy": 0.5
     }
   },
-  "extraction_failures": 6
+  "extraction_failures": 6,
+  "power_sampling_config": {
+    "alpha": 4.0,
+    "top_k": 8,
+    "num_rollouts": 8,
+    "lookahead": 32,
+    "batch_size": 8,
+    "num_candidates": 32
+  }
 }
