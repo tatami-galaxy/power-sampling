@@ -118,6 +118,12 @@ def jackknife_power_distribution(
 
     # Clamp and renormalize (jackknife can produce negative values)
     p_jk = p_jk.clamp(min=0.0)
-    p_jk = p_jk / p_jk.sum(dim=-1, keepdim=True)
+    p_jk_sum = p_jk.sum(dim=-1, keepdim=True)
+    # Fall back to uncorrected distribution if jackknife zeroed everything out
+    degenerate = (p_jk_sum == 0.0).squeeze(-1)
+    if degenerate.any():
+        p_jk[degenerate] = p_full[degenerate]
+        p_jk_sum = p_jk.sum(dim=-1, keepdim=True)
+    p_jk = p_jk / p_jk_sum
 
     return p_jk.squeeze(0)

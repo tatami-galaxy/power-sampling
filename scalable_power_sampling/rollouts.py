@@ -110,15 +110,12 @@ def generate_rollouts(
 def _expand_kv_cache(past_key_values, n: int):
     """Repeat each KV-cache tensor n times along the batch dimension."""
     if isinstance(past_key_values, Cache):
-        expanded_data = []
+        cache = DynamicCache()
         for layer_data in past_key_values:
             keys, values = layer_data[0], layer_data[1]
-            entry = (keys.repeat_interleave(n, dim=0), values.repeat_interleave(n, dim=0))
-            # Preserve sliding window info if present
-            if len(layer_data) == 3 and layer_data[2] is not None:
-                entry = (*entry, layer_data[2])
-            expanded_data.append(entry)
-        return DynamicCache(ddp_cache_data=expanded_data)
+            cache.key_cache.append(keys.repeat_interleave(n, dim=0))
+            cache.value_cache.append(values.repeat_interleave(n, dim=0))
+        return cache
 
     # Legacy tuple-of-tuples format
     expanded = []
@@ -132,14 +129,12 @@ def _expand_kv_cache(past_key_values, n: int):
 def _select_kv_cache(past_key_values, index: int):
     """Select a single batch element from a KV-cache."""
     if isinstance(past_key_values, Cache):
-        selected_data = []
+        cache = DynamicCache()
         for layer_data in past_key_values:
             keys, values = layer_data[0], layer_data[1]
-            entry = (keys[index : index + 1], values[index : index + 1])
-            if len(layer_data) == 3 and layer_data[2] is not None:
-                entry = (*entry, layer_data[2])
-            selected_data.append(entry)
-        return DynamicCache(ddp_cache_data=selected_data)
+            cache.key_cache.append(keys[index : index + 1].clone())
+            cache.value_cache.append(values[index : index + 1].clone())
+        return cache
 
     # Legacy tuple-of-tuples format
     selected = []

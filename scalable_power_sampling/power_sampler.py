@@ -112,10 +112,19 @@ class PowerSampler:
             top_k_log_probs, top_k_indices = log_softmax_top_k(logits, self.top_k)
             # top_k_log_probs: (1, K), top_k_indices: (1, K)
 
-            if self.alpha == 1.0:
-                # No sharpening: sample from base distribution restricted to top-K
-                probs = torch.exp(top_k_log_probs)
-                probs = probs / probs.sum(dim=-1, keepdim=True)
+            is_final_step = (step == self.max_new_tokens - 1)
+
+            if self.alpha == 1.0 or is_final_step:
+                # No sharpening (alpha=1) or final token: low-temperature sampling
+                # Paper Algorithm 1: "Sample x_T using low-temperature sampling"
+                if self.alpha > 1.0 and is_final_step:
+                    # Low-temperature = raise to power alpha and renormalize
+                    log_unnorm = self.alpha * top_k_log_probs
+                    log_probs_sharp = log_unnorm - torch.logsumexp(log_unnorm, dim=-1, keepdim=True)
+                    probs = torch.exp(log_probs_sharp)
+                else:
+                    probs = torch.exp(top_k_log_probs)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
                 idx = torch.multinomial(probs.squeeze(0), 1)
                 sampled_log_prob = top_k_log_probs[0, idx.item()].item()
             else:
