@@ -22,11 +22,16 @@ Usage:
 
     # Power sampling
     uv run python -m scripts.run_eval \
-    --model Qwen/Qwen2.5-0.5B \
-    --dataset math500 \
-    --num_samples 20 \
-    --power_sampling \
-    --alpha 4.0 --top_k 8 --num_rollouts 8 --lookahead 32
+        --model Qwen/Qwen2.5-0.5B \
+        --dataset math500 \
+        --num_samples 20 \
+        --power_sampling \
+        --alpha 4.0 --top_k 8 --num_rollouts 8 --lookahead 32
+
+    CUDA_VISIBLE_DEVICES=6 uv run python -m scripts.run_eval \
+        --model allenai/Olmo-3-1025-7B \
+        --chat_template_model allenai/Olmo-3-7B-Instruct \
+        --dataset math500 --num_samples 10 --power_sampling --use_vllm
 """
 
 import argparse
@@ -237,6 +242,7 @@ def evaluate_model(
     temperature: float = 0.0,
     tensor_parallel_size: int = 1,
     max_model_len: int | None = 4096,
+    chat_template_tokenizer=None,
 ) -> dict:
     """Run evaluation and return results dict."""
     print(f"\n{'='*60}")
@@ -261,10 +267,11 @@ def evaluate_model(
     )
 
     # Build prompts
+    template_tok = chat_template_tokenizer or tokenizer
     prompts = []
     for p in problems:
         messages = format_prompt(p["problem"])
-        text = tokenizer.apply_chat_template(
+        text = template_tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
         prompts.append(text)
@@ -310,6 +317,7 @@ def evaluate_model_power_sampling(
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     confidence_threshold: float | None = None,
+    chat_template_tokenizer=None,
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
@@ -388,11 +396,12 @@ def evaluate_model_power_sampling(
     results = []
     t0 = time.time()
 
+    template_tok = chat_template_tokenizer or tokenizer
     correct_so_far = 0
     pbar = tqdm(problems, desc=method, unit="problem")
     for i, prob in enumerate(pbar):
         messages = format_prompt(prob["problem"])
-        prompt_text = tokenizer.apply_chat_template(
+        prompt_text = template_tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
@@ -403,7 +412,7 @@ def evaluate_model_power_sampling(
             input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 
         sample_t0 = time.time()
-        out = sampler.generate(input_ids=input_ids, verbose=True)
+        out = sampler.generate(input_ids=input_ids, verbose=False)
         sample_elapsed = time.time() - sample_t0
 
         response = out["text"]
@@ -599,6 +608,9 @@ def main():
                         help="Use vLLM backend for power sampling (much faster, implies --batched)")
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
+    parser.add_argument("--chat_template_model", type=str, default=None,
+                        help="Load chat template from this model (e.g. the instruct variant) "
+                             "for base models that lack one")
 
     args = parser.parse_args()
 
@@ -616,6 +628,15 @@ def main():
         problems = random.sample(problems, args.num_samples)
         print(f"  Subsampled to {len(problems)} problems (seed={args.seed})")
 
+    # Load chat template tokenizer if specified
+    chat_template_tokenizer = None
+    if args.chat_template_model:
+        from transformers import AutoTokenizer
+        chat_template_tokenizer = AutoTokenizer.from_pretrained(
+            args.chat_template_model, trust_remote_code=True
+        )
+        print(f"Using chat template from: {args.chat_template_model}")
+
     # Evaluate each model
     for model_name in args.model:
         model_slug = model_name.replace("/", "_")
@@ -629,6 +650,7 @@ def main():
             temperature=args.temperature,
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len or None,
+            chat_template_tokenizer=chat_template_tokenizer,
         )
         print_report(eval_output)
         save_results(eval_output, output_dir)
@@ -650,6 +672,7 @@ def main():
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len or None,
                 confidence_threshold=args.confidence_threshold,
+                chat_template_tokenizer=chat_template_tokenizer,
             )
             print_report(ps_output)
             ps_dir = output_dir + "/" + ps_output["method"]
