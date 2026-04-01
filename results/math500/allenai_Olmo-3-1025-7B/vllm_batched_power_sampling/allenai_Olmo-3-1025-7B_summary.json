@@ -1,24 +1,24 @@
 {
   "model": "allenai/Olmo-3-1025-7B",
-  "method": "greedy",
+  "method": "vllm_batched_power_sampling",
   "dataset_size": 10,
-  "overall_accuracy": 0.8,
-  "elapsed_s": 36.206223249435425,
+  "overall_accuracy": 0.5,
+  "elapsed_s": 2496.3731186389923,
   "by_level": {
     "2": {
-      "correct": 1,
+      "correct": 0,
       "total": 1,
-      "accuracy": 1.0
+      "accuracy": 0.0
     },
     "3": {
-      "correct": 1,
+      "correct": 0,
       "total": 2,
-      "accuracy": 0.5
+      "accuracy": 0.0
     },
     "4": {
-      "correct": 4,
+      "correct": 3,
       "total": 4,
-      "accuracy": 1.0
+      "accuracy": 0.75
     },
     "5": {
       "correct": 2,
@@ -33,14 +33,14 @@
       "accuracy": 1.0
     },
     "Intermediate Algebra": {
-      "correct": 1,
+      "correct": 0,
       "total": 3,
-      "accuracy": 0.3333333333333333
+      "accuracy": 0.0
     },
     "Number Theory": {
-      "correct": 4,
+      "correct": 2,
       "total": 4,
-      "accuracy": 1.0
+      "accuracy": 0.5
     },
     "Prealgebra": {
       "correct": 2,
@@ -48,5 +48,13 @@
       "accuracy": 1.0
     }
   },
-  "extraction_failures": 2
+  "extraction_failures": 4,
+  "power_sampling_config": {
+    "alpha": 4.0,
+    "top_k": 8,
+    "num_rollouts": 8,
+    "lookahead": 32,
+    "batch_size": 8,
+    "num_candidates": 32
+  }
 }
