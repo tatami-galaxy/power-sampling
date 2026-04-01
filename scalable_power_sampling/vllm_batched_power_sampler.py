@@ -220,7 +220,7 @@ class VLLMBatchedPowerSampler:
                 for pos, tid in enumerate(selected_chunk):
                     if tid == self.eos_token_id:
                         prefix_ids = prefix_ids[
-                            : len(prefix_ids) - remainder + pos + 1
+                            : len(prefix_ids) - len(selected_chunk) + pos + 1
                         ]
                         break
 
