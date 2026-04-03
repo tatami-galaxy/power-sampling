@@ -39,179 +39,12 @@ import json
 import os
 import time
 from collections import defaultdict
-
-from datasets import load_dataset
 from vllm import LLM, SamplingParams
-
-import re
-
-from math_verify import parse, verify
-from math_verify.parser import (
-    ExprExtractionConfig,
-    LatexExtractionConfig,
+from utils import (
+    extract_boxed_answer,
+    is_equiv,
+    DATASET_REGISTRY_EVAL,
 )
-
-
-# ---------------------------------------------------------------------------
-# Answer extraction and equivalence checking
-# ---------------------------------------------------------------------------
-
-PRED_EXTRACTION_CONFIG = [
-    LatexExtractionConfig(boxed_match_priority=0),
-    ExprExtractionConfig(),
-]
-GOLD_EXTRACTION_CONFIG = [
-    LatexExtractionConfig(),
-    ExprExtractionConfig(),
-]
-
-
-def extract_boxed_answer(text: str) -> str | None:
-    """Extract the last \\boxed{...} answer from text, handling nested braces."""
-    idx = text.rfind("\\boxed{")
-    if idx == -1:
-        return None
-    depth = 0
-    start = idx + len("\\boxed{")
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            if depth == 0:
-                return text[start:i]
-            depth -= 1
-    return None
-
-
-def _normalize(s: str) -> str:
-    """Normalize a math answer string for string comparison."""
-    s = s.strip()
-    if s.startswith("$") and s.endswith("$"):
-        s = s[1:-1].strip()
-    # Remove \text{} wrapper
-    m = re.fullmatch(r"\\text\{(.+)\}", s)
-    if m:
-        s = m.group(1).strip()
-    # Remove display commands
-    s = s.replace("\\left", "").replace("\\right", "")
-    s = s.replace("\\,", "").replace("\\;", "").replace("\\!", "")
-    s = re.sub(r"\\dfrac", r"\\frac", s)
-    s = s.rstrip(".")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _try_parse_number(s: str) -> float | None:
-    """Try to parse a string as a number (int, float, or simple fraction)."""
-    s = s.replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    # a/b
-    m = re.fullmatch(r"(-?\d+)\s*/\s*(-?\d+)", s)
-    if m and int(m.group(2)) != 0:
-        return int(m.group(1)) / int(m.group(2))
-    # \frac{a}{b}
-    m = re.fullmatch(r"\\frac\{(-?\d+)\}\{(-?\d+)\}", s)
-    if m and int(m.group(2)) != 0:
-        return int(m.group(1)) / int(m.group(2))
-    # -\frac{a}{b}
-    m = re.fullmatch(r"-\\frac\{(\d+)\}\{(\d+)\}", s)
-    if m and int(m.group(2)) != 0:
-        return -int(m.group(1)) / int(m.group(2))
-    return None
-
-
-def is_equiv(pred: str, gold: str) -> bool:
-    """Check equivalence using layered strategies:
-    1. Normalized string match (fast, handles most cases)
-    2. Numeric comparison (fractions, decimals)
-    3. math_verify symbolic comparison (fallback for complex expressions)
-    """
-    pred_n = _normalize(pred)
-    gold_n = _normalize(gold)
-    # 1. Exact string match after normalization
-    if pred_n == gold_n:
-        return True
-    # 2. Numeric comparison
-    pred_v = _try_parse_number(pred_n)
-    gold_v = _try_parse_number(gold_n)
-    if pred_v is not None and gold_v is not None:
-        return abs(pred_v - gold_v) < 1e-6
-    # 3. Symbolic comparison via math_verify
-    try:
-        gold_parsed = parse(gold, extraction_config=GOLD_EXTRACTION_CONFIG)
-        pred_parsed = parse(pred, extraction_config=PRED_EXTRACTION_CONFIG)
-        return verify(gold_parsed, pred_parsed)
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Dataset loaders – each returns list[dict] with keys:
-#   problem, answer, level (int), subject, unique_id (optional)
-# ---------------------------------------------------------------------------
-
-DATASET_REGISTRY: dict[str, callable] = {}
-
-
-def register_dataset(name):
-    def wrapper(fn):
-        DATASET_REGISTRY[name] = fn
-        return fn
-    return wrapper
-
-
-@register_dataset("minerva_math")
-def load_minerva_math(levels: list[int] | None = None) -> list[dict]:
-    ds = load_dataset("math-ai/minervamath", split="test")
-    out = []
-    for row in ds:
-        out.append({
-            "problem": row["question"],
-            "answer": row["answer"],
-            "solution": "",
-            "level": 0,
-            "subject": "",
-            "unique_id": "",
-        })
-    return out
-
-
-@register_dataset("aime_2025")
-def load_aime_2025(levels: list[int] | None = None) -> list[dict]:
-    ds = load_dataset("MathArena/aime_2025", split="train")
-    out = []
-    for row in ds:
-        out.append({
-            "problem": row["problem"],
-            "answer": str(row["answer"]),
-            "solution": "",
-            "level": 0,
-            "subject": ", ".join(row["problem_type"]),
-            "unique_id": f"aime2025_{row['problem_idx']}",
-        })
-    return out
-
-
-@register_dataset("math500")
-def load_math500(levels: list[int] | None = None) -> list[dict]:
-    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
-    out = []
-    for row in ds:
-        level = int(str(row["level"]).removeprefix("Level "))
-        if levels and level not in levels:
-            continue
-        out.append({
-            "problem": row["problem"],
-            "answer": row["answer"],
-            "solution": row["solution"],
-            "level": level,
-            "subject": row["subject"],
-            "unique_id": row.get("unique_id", ""),
-        })
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +402,7 @@ def main():
         help="HuggingFace model name(s) or local checkpoint path(s)",
     )
     parser.add_argument(
-        "--dataset", default="math500", choices=list(DATASET_REGISTRY.keys()),
+        "--dataset", default="math500", choices=list(DATASET_REGISTRY_EVAL.keys()),
         help="Benchmark dataset to evaluate on",
     )
     parser.add_argument(
@@ -615,7 +448,7 @@ def main():
     args = parser.parse_args()
 
     # Load dataset
-    loader = DATASET_REGISTRY[args.dataset]
+    loader = DATASET_REGISTRY_EVAL[args.dataset]
     problems = loader(levels=args.levels)
     print(f"Loaded {len(problems)} problems from {args.dataset}")
     if args.levels:

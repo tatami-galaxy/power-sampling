@@ -46,20 +46,32 @@ import time
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
-from scripts.run_eval import (
-    DATASET_REGISTRY,
+from scripts.utils import (
+    DATASET_REGISTRY_EVAL,
     extract_boxed_answer,
-    format_prompt,
     is_equiv,
 )
 
 
 # ---------------------------------------------------------------------------
-# Answer-conditioned prompt
+# Prompt formatting
 # ---------------------------------------------------------------------------
 
+SYSTEM_PROMPT = (
+    "You are a helpful math assistant. Solve the following problem step by step. "
+    "Put your final answer in \\boxed{}."
+)
+
+
+def format_prompt(problem: str) -> list[dict]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem},
+    ]
+
+
 ANSWER_CONDITIONED_SYSTEM_PROMPT = (
-    "You are a helpful math assistant. You are given a problem along with its "
+    "You are a helpful math assistant. You are given a math problem along with its "
     "correct answer. Write a full step-by-step solution to the problem which "
     "concludes with the correct answer. Put the final answer in \\boxed{}."
 )
@@ -496,7 +508,7 @@ def main():
     parser.add_argument("--model", type=str, default=None,
                         help="Model to generate solutions with")
     parser.add_argument("--dataset", default="math500",
-                        choices=list(DATASET_REGISTRY.keys()))
+                        choices=list(DATASET_REGISTRY_EVAL.keys()))
     parser.add_argument("--levels", nargs="*", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -556,7 +568,7 @@ def main():
     else:
         assert args.model, "--model is required for generation"
 
-        problems = DATASET_REGISTRY[args.dataset](levels=args.levels)
+        problems = DATASET_REGISTRY_EVAL[args.dataset](levels=args.levels)
         print(f"Loaded {len(problems)} problems from {args.dataset}")
 
         if args.num_samples and args.num_samples < len(problems):

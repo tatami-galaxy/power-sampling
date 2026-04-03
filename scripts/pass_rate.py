@@ -20,6 +20,13 @@ Usage:
         --dataset math500 \
         --K 1 2 4 8 \
         --alpha 4.0
+
+    # Answer-conditioned: model sees the correct answer in the prompt
+    uv run python -m scripts.pass_rate \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --dataset math500 \
+        --K 1 2 4 8 \
+        --answer_conditioned
 """
 
 import argparse
@@ -32,12 +39,37 @@ import time
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
-from scripts.run_eval import (
-    DATASET_REGISTRY,
+from scripts.utils import (
+    DATASET_REGISTRY_EVAL,
     extract_boxed_answer,
-    format_prompt,
     is_equiv,
 )
+
+
+SYSTEM_PROMPT = (
+    "You are a helpful math assistant. Solve the following problem step by step. "
+    "Put your final answer in \\boxed{}."
+)
+
+ANSWER_CONDITIONED_SYSTEM_PROMPT = (
+    "You are a helpful math assistant. You are given a math problem along with its "
+    "correct answer. Write a full step-by-step solution to the problem which "
+    "concludes with the correct answer. Put the final answer in \\boxed{}."
+)
+
+
+def format_prompt(problem: str) -> list[dict]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem},
+    ]
+
+
+def format_prompt_answer_conditioned(problem: str, answer: str) -> list[dict]:
+    return [
+        {"role": "system", "content": ANSWER_CONDITIONED_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Problem: {problem}\n\nCorrect answer: {answer}"},
+    ]
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
@@ -61,12 +93,16 @@ def generate_base_solutions(
     K: int,
     max_tokens: int,
     chat_template_tokenizer=None,
+    answer_conditioned: bool = False,
 ) -> list[list[dict]]:
     """Generate K solutions per problem using base sampling (temperature=1)."""
     tokenizer = chat_template_tokenizer or llm.get_tokenizer()
     prompts = []
     for p in problems:
-        messages = format_prompt(p["problem"])
+        if answer_conditioned:
+            messages = format_prompt_answer_conditioned(p["problem"], p["answer"])
+        else:
+            messages = format_prompt(p["problem"])
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -115,6 +151,7 @@ def generate_power_solutions(
     max_model_len: int,
     confidence_threshold: float | None,
     chat_template_tokenizer=None,
+    answer_conditioned: bool = False,
 ) -> list[list[dict]]:
     """Generate K solutions per problem using power sampling."""
     from scalable_power_sampling import VLLMBatchedPowerSampler
@@ -143,7 +180,10 @@ def generate_power_solutions(
     all_solutions = []
     pbar = tqdm(problems, desc="power_sampling", unit="problem")
     for prob in pbar:
-        messages = format_prompt(prob["problem"])
+        if answer_conditioned:
+            messages = format_prompt_answer_conditioned(prob["problem"], prob["answer"])
+        else:
+            messages = format_prompt(prob["problem"])
         prompt_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -231,7 +271,7 @@ def main():
     )
     parser.add_argument("--model", required=True)
     parser.add_argument(
-        "--dataset", default="math500", choices=list(DATASET_REGISTRY.keys()),
+        "--dataset", default="math500", choices=list(DATASET_REGISTRY_EVAL.keys()),
     )
     parser.add_argument("--levels", nargs="*", type=int, default=None)
     parser.add_argument(
@@ -256,6 +296,8 @@ def main():
     parser.add_argument("--confidence_threshold", type=float, default=None)
 
     parser.add_argument("--chat_template_model", type=str, default=None)
+    parser.add_argument("--answer_conditioned", action="store_true",
+                        help="Include the correct answer in the prompt")
     parser.add_argument("--base_only", action="store_true",
                         help="Only run base sampling (skip power sampling)")
     parser.add_argument("--power_only", action="store_true",
@@ -264,7 +306,7 @@ def main():
     args = parser.parse_args()
 
     # Load dataset
-    problems = DATASET_REGISTRY[args.dataset](levels=args.levels)
+    problems = DATASET_REGISTRY_EVAL[args.dataset](levels=args.levels)
     print(f"Loaded {len(problems)} problems from {args.dataset}")
 
     if args.num_samples is not None and args.num_samples < len(problems):
@@ -299,6 +341,7 @@ def main():
         base_solutions = generate_base_solutions(
             llm, problems, max_k, args.max_tokens,
             chat_template_tokenizer=chat_template_tokenizer,
+            answer_conditioned=args.answer_conditioned,
         )
         base_pass = compute_pass_at_k(base_solutions, args.K)
 
@@ -324,6 +367,7 @@ def main():
             max_model_len=args.max_model_len,
             confidence_threshold=args.confidence_threshold,
             chat_template_tokenizer=chat_template_tokenizer,
+            answer_conditioned=args.answer_conditioned,
         )
         power_pass = compute_pass_at_k(power_solutions, args.K)
 
@@ -343,12 +387,14 @@ def main():
 
     # --- Save ---
     model_slug = args.model.replace("/", "_")
-    output_dir = os.path.join(args.output_dir, args.dataset, model_slug)
+    subdir = "answer_conditioned" if args.answer_conditioned else "unconditioned"
+    output_dir = os.path.join(args.output_dir, args.dataset, model_slug, subdir)
     os.makedirs(output_dir, exist_ok=True)
 
     output = {
         "model": args.model,
         "dataset": args.dataset,
+        "answer_conditioned": args.answer_conditioned,
         "num_problems": len(problems),
         "max_k": max_k,
         "k_values": args.K,
