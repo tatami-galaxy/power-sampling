@@ -26,6 +26,13 @@ Usage:
     uv run python -m scripts.judge_quality \
         --judge_model Qwen/Qwen2.5-32B-Instruct \
         --judge_from results/judge/math500/.../solutions.json
+
+    # Answer-conditioned: both base and power see the correct answer
+    uv run python -m scripts.judge_quality \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --judge_model Qwen/Qwen2.5-32B-Instruct \
+        --dataset math500 --num_samples 50 \
+        --answer_conditioned
 """
 
 import argparse
@@ -33,6 +40,7 @@ import json
 import os
 import random
 import re
+import statistics
 import time
 
 from tqdm import tqdm
@@ -44,6 +52,24 @@ from scripts.run_eval import (
     format_prompt,
     is_equiv,
 )
+
+
+# ---------------------------------------------------------------------------
+# Answer-conditioned prompt
+# ---------------------------------------------------------------------------
+
+ANSWER_CONDITIONED_SYSTEM_PROMPT = (
+    "You are a helpful math assistant. You are given a problem along with its "
+    "correct answer. Write a full step-by-step solution to the problem which "
+    "concludes with the correct answer. Put the final answer in \\boxed{}."
+)
+
+
+def format_prompt_answer_conditioned(problem: str, answer: str) -> list[dict]:
+    return [
+        {"role": "system", "content": ANSWER_CONDITIONED_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Problem: {problem}\n\nCorrect answer: {answer}"},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +136,7 @@ def generate_solutions(
     max_model_len: int,
     confidence_threshold: float | None,
     chat_template_tokenizer=None,
+    answer_conditioned: bool = False,
 ) -> list[dict]:
     """Generate one base and one power solution per problem.
 
@@ -130,13 +157,16 @@ def generate_solutions(
     llm = LLM(**llm_kwargs)
     tokenizer = chat_template_tokenizer or llm.get_tokenizer()
 
-    prompts = []
-    for p in problems:
-        messages = format_prompt(p["problem"])
-        text = tokenizer.apply_chat_template(
+    def _build_prompt(prob):
+        if answer_conditioned:
+            messages = format_prompt_answer_conditioned(prob["problem"], prob["answer"])
+        else:
+            messages = format_prompt(prob["problem"])
+        return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        prompts.append(text)
+
+    prompts = [_build_prompt(p) for p in problems]
 
     params = SamplingParams(temperature=1.0, max_tokens=max_tokens)
     t0 = time.time()
@@ -164,14 +194,20 @@ def generate_solutions(
     )
     ps_tokenizer = chat_template_tokenizer or sampler.tokenizer
 
+    def _build_ps_prompt(prob):
+        if answer_conditioned:
+            messages = format_prompt_answer_conditioned(prob["problem"], prob["answer"])
+        else:
+            messages = format_prompt(prob["problem"])
+        return ps_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
     power_texts = []
     t0 = time.time()
     pbar = tqdm(problems, desc="power_sampling", unit="problem")
     for prob in pbar:
-        messages = format_prompt(prob["problem"])
-        prompt_text = ps_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt_text = _build_ps_prompt(prob)
         input_ids = sampler.tokenizer.encode(prompt_text)
         out = sampler.generate(input_ids=input_ids, verbose=False)
         power_texts.append(out["text"])
@@ -193,12 +229,15 @@ def generate_solutions(
             "answer": prob["answer"],
             "level": prob.get("level", 0),
             "subject": prob.get("subject", ""),
+            "answer_conditioned": answer_conditioned,
             "base_solution": base_text,
             "power_solution": power_text,
             "base_pred": base_pred,
             "power_pred": power_pred,
             "base_correct": is_equiv(base_pred, prob["answer"]) if base_pred else False,
             "power_correct": is_equiv(power_pred, prob["answer"]) if power_pred else False,
+            "base_len": len(base_text),
+            "power_len": len(power_text),
         })
 
     return pairs
@@ -342,6 +381,20 @@ def print_report(results: list[dict]):
     print(f"Results ({n} problems)")
     print(f"{'='*60}")
 
+    # Response length stats
+    base_lens = [r["base_len"] for r in results if "base_len" in r]
+    power_lens = [r["power_len"] for r in results if "power_len" in r]
+
+    if base_lens and power_lens:
+        print(f"\nResponse length (chars):")
+        print(f"  {'':>12} {'Mean':>8} {'Median':>8} {'Min':>8} {'Max':>8}")
+        print(f"  {'Base':>12} {statistics.mean(base_lens):>8.0f} "
+              f"{statistics.median(base_lens):>8.0f} "
+              f"{min(base_lens):>8} {max(base_lens):>8}")
+        print(f"  {'Power':>12} {statistics.mean(power_lens):>8.0f} "
+              f"{statistics.median(power_lens):>8.0f} "
+              f"{min(power_lens):>8} {max(power_lens):>8}")
+
     print(f"\nCorrectness:")
     print(f"  Base:  {base_correct}/{n} ({base_correct/n*100:.1f}%)")
     print(f"  Power: {power_correct}/{n} ({power_correct/n*100:.1f}%)")
@@ -427,10 +480,15 @@ def main():
     # Judge args
     parser.add_argument("--judge_model", type=str, default="Qwen/Qwen3-4B-Instruct-2507",
                         help="HuggingFace model for judging (e.g. Qwen/Qwen2.5-32B-Instruct)")
-    parser.add_argument("--judge_max_tokens", type=int, default=1024)
+    parser.add_argument("--judge_max_tokens", type=int, default=4096)
     parser.add_argument("--judge_tensor_parallel_size", type=int, default=None,
                         help="TP size for judge (defaults to --tensor_parallel_size)")
     parser.add_argument("--judge_max_model_len", type=int, default=8192)
+
+    # Prompt conditioning
+    parser.add_argument("--answer_conditioned", action="store_true",
+                        help="Include the correct answer in the prompt for both "
+                             "base and power sampling")
 
     # Workflow control
     parser.add_argument("--generate_only", action="store_true",
@@ -483,11 +541,13 @@ def main():
             max_model_len=args.max_model_len,
             confidence_threshold=args.confidence_threshold,
             chat_template_tokenizer=chat_template_tokenizer,
+            answer_conditioned=args.answer_conditioned,
         )
 
         # Save solutions
         model_slug = args.model.replace("/", "_")
-        sol_dir = os.path.join(args.output_dir, args.dataset, model_slug)
+        subdir = "answer_conditioned" if args.answer_conditioned else "unconditioned"
+        sol_dir = os.path.join(args.output_dir, args.dataset, model_slug, subdir)
         os.makedirs(sol_dir, exist_ok=True)
         sol_path = os.path.join(sol_dir, "solutions.json")
         with open(sol_path, "w") as f:
@@ -521,7 +581,8 @@ def main():
         out_dir = os.path.dirname(args.judge_from)
     else:
         model_slug = args.model.replace("/", "_")
-        out_dir = os.path.join(args.output_dir, args.dataset, model_slug)
+        subdir = "answer_conditioned" if args.answer_conditioned else "unconditioned"
+        out_dir = os.path.join(args.output_dir, args.dataset, model_slug, subdir)
     os.makedirs(out_dir, exist_ok=True)
 
     judge_slug = args.judge_model.replace("/", "_")
@@ -545,6 +606,12 @@ def main():
             sum(1 for r in consistent if r["winner"] == "power") / len(consistent)
             if consistent else None
         ),
+        "response_length": {
+            "base_mean": statistics.mean(bl) if (bl := [r["base_len"] for r in results if "base_len" in r]) else None,
+            "base_median": statistics.median(bl) if bl else None,
+            "power_mean": statistics.mean(pl) if (pl := [r["power_len"] for r in results if "power_len" in r]) else None,
+            "power_median": statistics.median(pl) if pl else None,
+        },
     }
     summary_path = os.path.join(out_dir, f"judge_{judge_slug}_summary.json")
     with open(summary_path, "w") as f:
