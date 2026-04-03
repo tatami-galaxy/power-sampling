@@ -82,7 +82,7 @@ JUDGE_SYSTEM_PROMPT = (
 
 JUDGE_USER_TEMPLATE = """\
 You are given a math problem and two candidate solutions. \
-Evaluate which solution demonstrates better mathematical reasoning.
+Evaluate the mathematical reasoning in each solution.
 
 Focus on:
 - Logical coherence: Does each step follow from the previous?
@@ -101,20 +101,46 @@ A concise correct argument is better than a verbose flawed one.
 ## Solution B
 {solution_b}
 
-Which solution demonstrates better mathematical reasoning? You must choose one.
+Assess the reasoning quality of both solutions, then choose exactly one verdict:
+- **Verdict: A** — Solution A has clearly better reasoning than B.
+- **Verdict: B** — Solution B has clearly better reasoning than A.
+- **Verdict: Both Good** — Both solutions have correct, coherent reasoning \
+with no meaningful quality difference. Only choose this if both are \
+mathematically valid with no errors in intermediate steps.
+- **Verdict: Both Bad** — Both solutions have significant flaws in their \
+reasoning (wrong intermediate steps, logical gaps, or incorrect arguments).
+
 First explain your assessment briefly, then state your verdict on the \
-final line as exactly: **Verdict: A** or **Verdict: B**"""
+final line using one of the exact formats above."""
+
+
+VERDICT_PATTERN = re.compile(
+    r"\*\*Verdict:\s*(A|B|Both Good|Both Bad)\s*\*\*", re.IGNORECASE
+)
+VERDICT_FALLBACK = re.compile(
+    r"Verdict:\s*(A|B|Both Good|Both Bad)\s*$", re.IGNORECASE | re.MULTILINE
+)
+
+# Canonical forms for reconciliation
+_VERDICT_NORM = {
+    "a": "A",
+    "b": "B",
+    "both good": "Both Good",
+    "both bad": "Both Bad",
+}
 
 
 def parse_verdict(text: str) -> str | None:
-    """Extract verdict from judge response. Returns 'A', 'B', or None."""
-    match = re.search(r"\*\*Verdict:\s*([AB])\s*\*\*", text)
+    """Extract verdict from judge response.
+
+    Returns 'A', 'B', 'Both Good', 'Both Bad', or None.
+    """
+    match = VERDICT_PATTERN.search(text)
     if match:
-        return match.group(1)
-    # Fallback: look for unformatted "Verdict: A/B" at end
-    match = re.search(r"Verdict:\s*([AB])\s*$", text.strip())
+        return _VERDICT_NORM[match.group(1).lower()]
+    match = VERDICT_FALLBACK.search(text.strip())
     if match:
-        return match.group(1)
+        return _VERDICT_NORM[match.group(1).lower()]
     return None
 
 
@@ -330,22 +356,25 @@ def judge_solutions(
         fwd_verdict = parse_verdict(fwd_text)
         rev_verdict = parse_verdict(rev_text)
 
-        # Map verdicts to underlying solutions
-        # Forward: A=base, B=power  → verdict A means base, B means power
-        # Reverse: A=power, B=base  → verdict A means power, B means base
-        fwd_prefers = (
-            "base" if fwd_verdict == "A"
-            else "power" if fwd_verdict == "B"
-            else None
-        )
-        rev_prefers = (
-            "power" if rev_verdict == "A"
-            else "base" if rev_verdict == "B"
-            else None
-        )
+        # Map verdicts to underlying solutions / categories
+        # Forward: A=base, B=power
+        # Reverse: A=power, B=base
+        # "Both Good" / "Both Bad" are position-independent
+        def _map_verdict(verdict, is_forward):
+            if verdict == "Both Good":
+                return "both_good"
+            if verdict == "Both Bad":
+                return "both_bad"
+            if is_forward:
+                return "base" if verdict == "A" else "power" if verdict == "B" else None
+            else:
+                return "power" if verdict == "A" else "base" if verdict == "B" else None
 
-        if fwd_prefers and rev_prefers and fwd_prefers == rev_prefers:
-            winner = fwd_prefers
+        fwd_mapped = _map_verdict(fwd_verdict, is_forward=True)
+        rev_mapped = _map_verdict(rev_verdict, is_forward=False)
+
+        if fwd_mapped and rev_mapped and fwd_mapped == rev_mapped:
+            winner = fwd_mapped
         else:
             winner = "inconsistent"
 
@@ -355,8 +384,8 @@ def judge_solutions(
             "rev_judge_response": rev_text,
             "fwd_verdict": fwd_verdict,
             "rev_verdict": rev_verdict,
-            "fwd_prefers": fwd_prefers,
-            "rev_prefers": rev_prefers,
+            "fwd_mapped": fwd_mapped,
+            "rev_mapped": rev_mapped,
             "winner": winner,
         })
 
@@ -367,12 +396,18 @@ def judge_solutions(
 # Reporting
 # ---------------------------------------------------------------------------
 
+def _count_winners(results: list[dict]) -> dict[str, int]:
+    """Count occurrences of each winner category."""
+    counts = {"base": 0, "power": 0, "both_good": 0, "both_bad": 0, "inconsistent": 0}
+    for r in results:
+        counts[r["winner"]] = counts.get(r["winner"], 0) + 1
+    return counts
+
+
 def print_report(results: list[dict]):
     """Print judge preference summary."""
     n = len(results)
-    base_wins = sum(1 for r in results if r["winner"] == "base")
-    power_wins = sum(1 for r in results if r["winner"] == "power")
-    inconsistent = sum(1 for r in results if r["winner"] == "inconsistent")
+    counts = _count_winners(results)
 
     base_correct = sum(1 for r in results if r["base_correct"])
     power_correct = sum(1 for r in results if r["power_correct"])
@@ -399,17 +434,19 @@ def print_report(results: list[dict]):
     print(f"  Base:  {base_correct}/{n} ({base_correct/n*100:.1f}%)")
     print(f"  Power: {power_correct}/{n} ({power_correct/n*100:.1f}%)")
 
-    print(f"\nJudge preference:")
-    print(f"  Base preferred:  {base_wins}/{n} ({base_wins/n*100:.1f}%)")
-    print(f"  Power preferred: {power_wins}/{n} ({power_wins/n*100:.1f}%)")
-    print(f"  Inconsistent:    {inconsistent}/{n} ({inconsistent/n*100:.1f}%)")
+    print(f"\nJudge verdict:")
+    print(f"  Base preferred:  {counts['base']:>4}/{n} ({counts['base']/n*100:.1f}%)")
+    print(f"  Power preferred: {counts['power']:>4}/{n} ({counts['power']/n*100:.1f}%)")
+    print(f"  Both good:       {counts['both_good']:>4}/{n} ({counts['both_good']/n*100:.1f}%)")
+    print(f"  Both bad:        {counts['both_bad']:>4}/{n} ({counts['both_bad']/n*100:.1f}%)")
+    print(f"  Inconsistent:    {counts['inconsistent']:>4}/{n} ({counts['inconsistent']/n*100:.1f}%)")
 
-    consistent = [r for r in results if r["winner"] != "inconsistent"]
-    if consistent:
-        pw = sum(1 for r in consistent if r["winner"] == "power")
+    # Win rate among decisive verdicts (base or power preferred)
+    decisive = counts["base"] + counts["power"]
+    if decisive:
         print(
-            f"  Power win rate (excl. inconsistent): "
-            f"{pw}/{len(consistent)} ({pw/len(consistent)*100:.1f}%)"
+            f"  Power win rate (decisive only): "
+            f"{counts['power']}/{decisive} ({counts['power']/decisive*100:.1f}%)"
         )
 
     # Breakdown by correctness
@@ -429,18 +466,18 @@ def print_report(results: list[dict]):
     }
 
     print(f"\nBreakdown by correctness:")
-    print(f"  {'Category':<24} {'N':>4} {'Base':>6} {'Power':>6} {'Incon':>6}")
-    print(f"  {'-'*48}")
+    print(f"  {'Category':<24} {'N':>4} {'Base':>6} {'Power':>6} "
+          f"{'Good':>6} {'Bad':>6} {'Incon':>6}")
+    print(f"  {'-'*60}")
     for cat_name, cat_results in categories.items():
         if not cat_results:
             print(f"  {cat_name:<24} {0:>4}")
             continue
-        bw = sum(1 for r in cat_results if r["winner"] == "base")
-        pw = sum(1 for r in cat_results if r["winner"] == "power")
-        inc = sum(1 for r in cat_results if r["winner"] == "inconsistent")
+        c = _count_winners(cat_results)
         print(
             f"  {cat_name:<24} {len(cat_results):>4} "
-            f"{bw:>6} {pw:>6} {inc:>6}"
+            f"{c['base']:>6} {c['power']:>6} "
+            f"{c['both_good']:>6} {c['both_bad']:>6} {c['inconsistent']:>6}"
         )
 
     print(f"{'='*60}")
@@ -593,18 +630,16 @@ def main():
 
     # Save summary
     n = len(results)
-    consistent = [r for r in results if r["winner"] != "inconsistent"]
+    counts = _count_winners(results)
+    decisive = counts["base"] + counts["power"]
     summary = {
         "judge_model": args.judge_model,
         "num_problems": n,
         "base_correct": sum(1 for r in results if r["base_correct"]),
         "power_correct": sum(1 for r in results if r["power_correct"]),
-        "base_wins": sum(1 for r in results if r["winner"] == "base"),
-        "power_wins": sum(1 for r in results if r["winner"] == "power"),
-        "inconsistent": sum(1 for r in results if r["winner"] == "inconsistent"),
-        "power_win_rate_consistent": (
-            sum(1 for r in consistent if r["winner"] == "power") / len(consistent)
-            if consistent else None
+        "verdicts": counts,
+        "power_win_rate_decisive": (
+            counts["power"] / decisive if decisive else None
         ),
         "response_length": {
             "base_mean": statistics.mean(bl) if (bl := [r["base_len"] for r in results if "base_len" in r]) else None,
