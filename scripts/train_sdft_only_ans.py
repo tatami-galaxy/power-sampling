@@ -568,8 +568,6 @@ def train(args):
 
     pre = len(train_ds)
     train_ds = train_ds.filter(_fits, num_proc=4)
-    print(train_ds[0])
-    quit()
     print(f"Filtered by max_prompt_length={args.max_prompt_length}: {pre} → {len(train_ds)}")
 
 
