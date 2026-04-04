@@ -34,7 +34,6 @@ import json
 import os
 import re
 import statistics
-from collections import defaultdict
 from glob import glob
 
 # ---------------------------------------------------------------------------
@@ -305,14 +304,14 @@ def generate_for_alpha_sweep(
 ) -> list[tuple[str, str]]:
     """Generate results for base + each alpha value. Returns (path, label) pairs."""
     from scripts.run_eval import (
-        DATASET_REGISTRY,
         evaluate_model,
         evaluate_model_power_sampling,
         save_results,
     )
+    from scripts.utils import DATASET_REGISTRY_EVAL
     import random
 
-    loader = DATASET_REGISTRY[dataset]
+    loader = DATASET_REGISTRY_EVAL[dataset]
     problems = loader(levels=levels)
     if num_samples is not None and num_samples < len(problems):
         random.seed(seed)

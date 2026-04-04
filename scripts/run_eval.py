@@ -40,7 +40,7 @@ import os
 import time
 from collections import defaultdict
 from vllm import LLM, SamplingParams
-from utils import (
+from scripts.utils import (
     extract_boxed_answer,
     is_equiv,
     DATASET_REGISTRY_EVAL,

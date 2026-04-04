@@ -308,7 +308,7 @@ class SDFTTrainer(Trainer):
         kl_direction: str = "forward",
         # vLLM options
         use_vllm: bool = False,
-        vllm_server_url: str = "http://localhost:8000/v1",
+        vllm_port: int = 8000,
         importance_sampling_correction: bool = True,
         importance_sampling_cap: float = 2.0,
         **kwargs,
@@ -330,7 +330,7 @@ class SDFTTrainer(Trainer):
                     "Install it with: pip install openai"
                 )
             self.vllm_client = _OpenAI(
-                base_url=vllm_server_url,
+                base_url=f"http://localhost:{vllm_port}/v1",
                 api_key="unused",  # vLLM doesn't require a real key
             )
 
@@ -404,8 +404,8 @@ class SDFTTrainer(Trainer):
             # ── 1a. Generate via vLLM server ─────────────────────────────────
             prompt_texts = inputs["student_prompt_texts"]
             completions, vllm_token_logprobs = self._generate_vllm(prompt_texts)
-            student_prompts = [s_ids[i][s_mask[i].bool()] for i in range(B)]
-            teacher_prompts = [t_ids[i][t_mask[i].bool()] for i in range(B)]
+            student_prompts = [s_ids[i][s_mask[i].bool()].cpu() for i in range(B)]
+            teacher_prompts = [t_ids[i][t_mask[i].bool()].cpu() for i in range(B)]
         else:
             # ── 1b. Generate via HF model (batched, left-padded) ─────────────
             model.eval()
@@ -443,9 +443,9 @@ class SDFTTrainer(Trainer):
                     comp = comp[: non_pad[-1] + 1]
                 else:
                     comp = comp[:0]
-                completions.append(comp)
-                student_prompts.append(s_ids[i][s_mask[i].bool()])
-                teacher_prompts.append(t_ids[i][t_mask[i].bool()])
+                completions.append(comp.cpu())
+                student_prompts.append(s_ids[i][s_mask[i].bool()].cpu())
+                teacher_prompts.append(t_ids[i][t_mask[i].bool()].cpu())
 
         # ── 2. Build padded full sequences (prompt ‖ completion) ─────────────
         sf_ids, sf_mask, comp_s = _build_padded_batch(student_prompts, completions, pad_id)
@@ -643,7 +643,7 @@ def train(args):
         kl_direction=args.kl_direction,
         # vLLM
         use_vllm=args.use_vllm,
-        vllm_server_url=args.vllm_server_url,
+        vllm_port=args.vllm_port,
         importance_sampling_correction=args.importance_sampling_correction,
         importance_sampling_cap=args.importance_sampling_cap,
     )
@@ -669,7 +669,7 @@ def train(args):
     print(f"  KL direction:        {args.kl_direction}")
     print(f"  Learning rate:       {args.learning_rate}")
     if args.use_vllm:
-        print(f"  vLLM server:         {args.vllm_server_url}")
+        print(f"  vLLM port:           {args.vllm_port}")
         print(f"  vLLM sync steps:     {args.vllm_sync_steps}")
         print(f"  IS correction:       {args.importance_sampling_correction}")
         print(f"  IS cap:              {args.importance_sampling_cap}")
@@ -706,9 +706,9 @@ def main():
     parser.add_argument("--max_samples", type=int, default=None)
 
     # Generation (on-policy sampling)
-    parser.add_argument("--max_new_tokens", type=int, default=8192,
+    parser.add_argument("--max_new_tokens", type=int, default=4096,
                         help="Max completion length for on-policy generation")
-    parser.add_argument("--max_prompt_length", type=int, default=8192,
+    parser.add_argument("--max_prompt_length", type=int, default=4096,
                         help="Max tokenized length for student/teacher prompts")
 
     # SDFT-specific hyperparameters
@@ -723,8 +723,8 @@ def main():
     # vLLM (optional, for faster on-policy generation)
     parser.add_argument("--use_vllm", action="store_true",
                         help="Use a vLLM server for on-policy generation (requires running vLLM server)")
-    parser.add_argument("--vllm_server_url", type=str, default="http://localhost:8000/v1",
-                        help="Base URL of the vLLM OpenAI-compatible server")
+    parser.add_argument("--vllm_port", type=int, default=8000,
+                        help="Port of the vLLM OpenAI-compatible server")
     parser.add_argument("--vllm_sync_steps", type=int, default=512,
                         help="Save checkpoint for vLLM weight reload every N steps")
     parser.add_argument("--importance_sampling_correction", action="store_true", default=True,
