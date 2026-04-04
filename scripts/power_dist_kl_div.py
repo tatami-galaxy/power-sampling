@@ -15,7 +15,7 @@ Pipeline:
   3. Report metrics
 
 Usage:
-    uv run python scripts/power_dist_kl_div.py \
+    uv run python -m scripts.power_dist_kl_div.py \
         --base_model Qwen/Qwen3-1.7B \
         --checkpoint_dir checkpoints/ \
         --chat_template_model Qwen/Qwen3-1.7B-Instruct \
