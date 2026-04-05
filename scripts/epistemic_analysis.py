@@ -10,6 +10,8 @@ that signal self-correction in reasoning:
 Modes:
   1. Analyse existing results (no GPU needed)
   2. Generate fresh results across multiple alpha values, then analyse
+  3. Generate teacher-conditioned results (SDFT self-teacher) alongside
+     base / power results to compare epistemic suppression
 
 Usage:
     # Analyse existing base vs power results
@@ -27,6 +29,19 @@ Usage:
         --dataset math500 --num_samples 50 \
         --alphas 1.0 2.0 4.0 6.0 8.0 \
         --use_vllm
+
+    # Include SDFT teacher-conditioned generations
+    uv run python -m scripts.epistemic_analysis \
+        --model Qwen/Qwen3-4B \
+        --dataset math500 --num_samples 50 \
+        --alphas 1.0 2.0 4.0 6.0 8.0 \
+        --include_teacher --use_vllm
+
+    # Teacher-conditioned only (no power sweep)
+    uv run python -m scripts.epistemic_analysis \
+        --model Qwen/Qwen3-4B \
+        --dataset math500 --num_samples 50 \
+        --alphas 1.0 --include_teacher --use_vllm
 """
 
 import argparse
@@ -383,6 +398,150 @@ def generate_for_alpha_sweep(
 
 
 # ---------------------------------------------------------------------------
+# Teacher-conditioned generation (SDFT self-teacher)
+# ---------------------------------------------------------------------------
+
+def generate_teacher_conditioned(
+    model_name: str,
+    dataset: str,
+    num_samples: int | None,
+    seed: int,
+    max_tokens: int,
+    tensor_parallel_size: int,
+    max_model_len: int,
+    chat_template_model: str | None,
+    output_dir: str,
+    levels: list[int] | None,
+    teacher_template: int,
+    problems: list[dict] | None = None,
+) -> tuple[str, str]:
+    """Generate responses under the SDFT teacher context (question + solution).
+
+    Uses the same model but with richer input context — the teacher template
+    from train_sdft.py that includes the expert demonstration.  This lets us
+    measure how much epistemic verbalization the teacher suppresses compared
+    to the base (student) and power-sampled conditions.
+
+    Returns (results_path, label).
+    """
+    from scripts.run_eval import save_results
+    from scripts.train_sdft import (
+        SYSTEM_PROMPT as SDFT_SYSTEM_PROMPT,
+        TEACHER_TEMPLATE_1,
+        TEACHER_TEMPLATE_2,
+    )
+    from scripts.utils import DATASET_REGISTRY_EVAL, extract_boxed_answer, is_equiv
+    import random
+    import time
+
+    template = TEACHER_TEMPLATE_1 if teacher_template == 1 else TEACHER_TEMPLATE_2
+    template_label = f"teacher_t{teacher_template}"
+
+    # ── Load problems ───────────────────────────────────────────────────────
+    if problems is None:
+        loader = DATASET_REGISTRY_EVAL[dataset]
+        problems = loader(levels=levels)
+        if num_samples is not None and num_samples < len(problems):
+            random.seed(seed)
+            problems = random.sample(problems, num_samples)
+
+    # Validate that problems have solutions (needed for teacher context)
+    missing = [i for i, p in enumerate(problems) if not p.get("solution")]
+    if missing:
+        raise ValueError(
+            f"Teacher mode requires problems with 'solution' field. "
+            f"{len(missing)}/{len(problems)} problems are missing solutions."
+        )
+
+    model_slug = model_name.replace("/", "_")
+    base_dir = os.path.join(output_dir, dataset, model_slug)
+    teacher_dir = os.path.join(base_dir, template_label)
+    results_path = os.path.join(teacher_dir, f"{model_slug}_results.json")
+
+    if os.path.exists(results_path):
+        print(f"Teacher results already exist: {results_path}")
+        return results_path, template_label
+
+    # ── Build teacher-conditioned prompts ────────────────────────────────────
+    from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
+
+    if chat_template_model:
+        template_tok = AutoTokenizer.from_pretrained(
+            chat_template_model, trust_remote_code=True
+        )
+    else:
+        template_tok = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
+
+    prompts = []
+    for p in problems:
+        solution = p["solution"].strip()
+        if "\\boxed" not in solution:
+            solution += f"\n\nThe answer is $\\boxed{{{p['answer']}}}$."
+
+        teacher_messages = [
+            {"role": "system", "content": SDFT_SYSTEM_PROMPT},
+            {"role": "user", "content": template.format(
+                question=p["problem"], demonstration=solution,
+            )},
+        ]
+        text = template_tok.apply_chat_template(
+            teacher_messages, tokenize=False, add_generation_prompt=True,
+        )
+        prompts.append(text)
+
+    # ── Generate ─────────────────────────────────────────────────────────────
+    llm_kwargs = dict(
+        model=model_name,
+        tensor_parallel_size=tensor_parallel_size,
+        trust_remote_code=True,
+        dtype="bfloat16",
+    )
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    llm = LLM(**llm_kwargs)
+    sampling_params = SamplingParams(temperature=1.0, max_tokens=max_tokens)
+
+    print(f"\nGenerating teacher-conditioned responses ({template_label})...")
+    t0 = time.time()
+    outputs = llm.generate(prompts, sampling_params)
+    elapsed = time.time() - t0
+    print(f"Teacher generation took {elapsed:.1f}s ({len(problems)/elapsed:.1f} problems/s)")
+
+    # ── Score ─────────────────────────────────────────────────────────────────
+    results = []
+    for prob, output in zip(problems, outputs):
+        response = output.outputs[0].text
+        pred_answer = extract_boxed_answer(response)
+        correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
+        results.append({
+            **prob,
+            "response": response,
+            "pred_answer": pred_answer,
+            "correct": correct,
+        })
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    os.makedirs(teacher_dir, exist_ok=True)
+    save_results({"model": model_name, "results": results, "elapsed_s": elapsed}, teacher_dir)
+    print(f"Saved teacher results: {results_path}")
+
+    # Clean up GPU memory before returning
+    del llm
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return results_path, template_label
+
+
+# ---------------------------------------------------------------------------
 # Save analysis
 # ---------------------------------------------------------------------------
 
@@ -441,6 +600,16 @@ def main():
         help="Alpha values to sweep",
     )
 
+    # SDFT teacher-conditioned generation
+    parser.add_argument(
+        "--include_teacher", action="store_true",
+        help="Also generate under SDFT teacher context (question + expert solution)",
+    )
+    parser.add_argument(
+        "--teacher_template", type=int, default=2, choices=[1, 2],
+        help="Which teacher template to use (1 or 2, default: 2 matches active template in train_sdft.py)",
+    )
+
     # Power sampling hyperparams
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--num_rollouts", type=int, default=8)
@@ -488,6 +657,34 @@ def main():
             output_dir=args.output_dir,
             levels=args.levels,
         )
+
+        # Teacher-conditioned generation (SDFT self-teacher)
+        if args.include_teacher:
+            # Load the same problem subset used by the alpha sweep
+            from scripts.utils import DATASET_REGISTRY_EVAL
+            import random as _rng
+
+            loader = DATASET_REGISTRY_EVAL[args.dataset]
+            problems = loader(levels=args.levels)
+            if args.num_samples is not None and args.num_samples < len(problems):
+                _rng.seed(args.seed)
+                problems = _rng.sample(problems, args.num_samples)
+
+            teacher_path, teacher_label = generate_teacher_conditioned(
+                model_name=args.model,
+                dataset=args.dataset,
+                num_samples=args.num_samples,
+                seed=args.seed,
+                max_tokens=args.max_tokens,
+                tensor_parallel_size=args.tensor_parallel_size,
+                max_model_len=args.max_model_len,
+                chat_template_model=args.chat_template_model,
+                output_dir=args.output_dir,
+                levels=args.levels,
+                teacher_template=args.teacher_template,
+                problems=problems,
+            )
+            result_files.append((teacher_path, teacher_label))
     elif args.results_dir:
         result_files = discover_results_in_dir(args.results_dir)
     else:
