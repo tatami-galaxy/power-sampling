@@ -3,7 +3,7 @@
   "method": "greedy",
   "dataset_size": 50,
   "overall_accuracy": 0.4,
-  "elapsed_s": 42.31740951538086,
+  "elapsed_s": 42.517040729522705,
   "by_level": {
     "1": {
       "correct": 2,
