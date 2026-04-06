@@ -33,6 +33,13 @@ Usage:
         --judge_model Qwen/Qwen2.5-32B-Instruct \
         --dataset math500 --num_samples 50 \
         --answer_conditioned
+
+    # Base sees the answer, power does not (SDFT teacher proxy vs power dist)
+    uv run python -m scripts.judge_quality \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --judge_model Qwen/Qwen2.5-32B-Instruct \
+        --dataset math500 --num_samples 50 \
+        --base_answer_conditioned
 """
 
 import argparse
@@ -174,16 +181,21 @@ def generate_solutions(
     max_model_len: int,
     confidence_threshold: float | None,
     chat_template_tokenizer=None,
-    answer_conditioned: bool = False,
+    base_answer_conditioned: bool = False,
+    power_answer_conditioned: bool = False,
 ) -> list[dict]:
     """Generate one base and one power solution per problem.
+
+    Base and power can be independently conditioned on the correct answer,
+    enabling comparisons like answer-conditioned base vs unconditioned power.
 
     Returns list of dicts with keys: problem, answer, base_solution,
     power_solution, base_pred, power_pred, base_correct, power_correct.
     """
 
     # --- Base solutions via vLLM ---
-    print("\n=== Phase 1a: Base sampling ===")
+    cond_label = " (answer-conditioned)" if base_answer_conditioned else ""
+    print(f"\n=== Phase 1a: Base sampling{cond_label} ===")
     llm_kwargs = dict(
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
@@ -196,7 +208,7 @@ def generate_solutions(
     tokenizer = chat_template_tokenizer or llm.get_tokenizer()
 
     def _build_prompt(prob):
-        if answer_conditioned:
+        if base_answer_conditioned:
             messages = format_prompt_answer_conditioned(prob["problem"], prob["answer"])
         else:
             messages = format_prompt(prob["problem"])
@@ -214,7 +226,8 @@ def generate_solutions(
     del llm  # free GPU for power sampler
 
     # --- Power solutions via VLLMBatchedPowerSampler ---
-    print("\n=== Phase 1b: Power sampling ===")
+    cond_label = " (answer-conditioned)" if power_answer_conditioned else ""
+    print(f"\n=== Phase 1b: Power sampling{cond_label} ===")
     from scalable_power_sampling import VLLMBatchedPowerSampler
 
     sampler = VLLMBatchedPowerSampler(
@@ -233,7 +246,7 @@ def generate_solutions(
     ps_tokenizer = chat_template_tokenizer or sampler.tokenizer
 
     def _build_ps_prompt(prob):
-        if answer_conditioned:
+        if power_answer_conditioned:
             messages = format_prompt_answer_conditioned(prob["problem"], prob["answer"])
         else:
             messages = format_prompt(prob["problem"])
@@ -267,7 +280,8 @@ def generate_solutions(
             "answer": prob["answer"],
             "level": prob.get("level", 0),
             "subject": prob.get("subject", ""),
-            "answer_conditioned": answer_conditioned,
+            "base_answer_conditioned": base_answer_conditioned,
+            "power_answer_conditioned": power_answer_conditioned,
             "base_solution": base_text,
             "power_solution": power_text,
             "base_pred": base_pred,
@@ -424,8 +438,17 @@ def print_report(results: list[dict]):
     base_correct = sum(1 for r in results if r["base_correct"])
     power_correct = sum(1 for r in results if r["power_correct"])
 
+    # Derive labels from conditioning metadata
+    r0 = results[0] if results else {}
+    base_ac = r0.get("base_answer_conditioned", r0.get("answer_conditioned", False))
+    power_ac = r0.get("power_answer_conditioned", r0.get("answer_conditioned", False))
+    base_label = "Base+answer" if base_ac else "Base"
+    power_label = "Power+answer" if power_ac else "Power"
+
     print(f"\n{'='*60}")
     print(f"Results ({n} problems)")
+    if base_ac or power_ac:
+        print(f"  {base_label} vs {power_label}")
     print(f"{'='*60}")
 
     # Response length stats
@@ -434,30 +457,30 @@ def print_report(results: list[dict]):
 
     if base_lens and power_lens:
         print(f"\nResponse length (chars):")
-        print(f"  {'':>12} {'Mean':>8} {'Median':>8} {'Min':>8} {'Max':>8}")
-        print(f"  {'Base':>12} {statistics.mean(base_lens):>8.0f} "
+        print(f"  {'':>16} {'Mean':>8} {'Median':>8} {'Min':>8} {'Max':>8}")
+        print(f"  {base_label:>16} {statistics.mean(base_lens):>8.0f} "
               f"{statistics.median(base_lens):>8.0f} "
               f"{min(base_lens):>8} {max(base_lens):>8}")
-        print(f"  {'Power':>12} {statistics.mean(power_lens):>8.0f} "
+        print(f"  {power_label:>16} {statistics.mean(power_lens):>8.0f} "
               f"{statistics.median(power_lens):>8.0f} "
               f"{min(power_lens):>8} {max(power_lens):>8}")
 
     print(f"\nCorrectness:")
-    print(f"  Base:  {base_correct}/{n} ({base_correct/n*100:.1f}%)")
-    print(f"  Power: {power_correct}/{n} ({power_correct/n*100:.1f}%)")
+    print(f"  {base_label}:  {base_correct}/{n} ({base_correct/n*100:.1f}%)")
+    print(f"  {power_label}: {power_correct}/{n} ({power_correct/n*100:.1f}%)")
 
     print(f"\nJudge verdict:")
-    print(f"  Base preferred:  {counts['base']:>4}/{n} ({counts['base']/n*100:.1f}%)")
-    print(f"  Power preferred: {counts['power']:>4}/{n} ({counts['power']/n*100:.1f}%)")
-    print(f"  Both good:       {counts['both_good']:>4}/{n} ({counts['both_good']/n*100:.1f}%)")
-    print(f"  Both bad:        {counts['both_bad']:>4}/{n} ({counts['both_bad']/n*100:.1f}%)")
-    print(f"  Inconsistent:    {counts['inconsistent']:>4}/{n} ({counts['inconsistent']/n*100:.1f}%)")
+    print(f"  {base_label+' preferred:':<22} {counts['base']:>4}/{n} ({counts['base']/n*100:.1f}%)")
+    print(f"  {power_label+' preferred:':<22} {counts['power']:>4}/{n} ({counts['power']/n*100:.1f}%)")
+    print(f"  {'Both good:':<22} {counts['both_good']:>4}/{n} ({counts['both_good']/n*100:.1f}%)")
+    print(f"  {'Both bad:':<22} {counts['both_bad']:>4}/{n} ({counts['both_bad']/n*100:.1f}%)")
+    print(f"  {'Inconsistent:':<22} {counts['inconsistent']:>4}/{n} ({counts['inconsistent']/n*100:.1f}%)")
 
     # Win rate among decisive verdicts (base or power preferred)
     decisive = counts["base"] + counts["power"]
     if decisive:
         print(
-            f"  Power win rate (decisive only): "
+            f"  {power_label} win rate (decisive only): "
             f"{counts['power']}/{decisive} ({counts['power']/decisive*100:.1f}%)"
         )
 
@@ -527,7 +550,7 @@ def main():
     parser.add_argument("--confidence_threshold", type=float, default=None)
 
     # Judge args
-    parser.add_argument("--judge_model", type=str, default="Qwen/Qwen3-4B-Instruct-2507",
+    parser.add_argument("--judge_model", type=str, default="Qwen/Qwen3-30B-A3B-Instruct-2507",
                         help="HuggingFace model for judging (e.g. Qwen/Qwen2.5-32B-Instruct)")
     parser.add_argument("--judge_max_tokens", type=int, default=4096)
     parser.add_argument("--judge_tensor_parallel_size", type=int, default=None,
@@ -535,9 +558,18 @@ def main():
     parser.add_argument("--judge_max_model_len", type=int, default=8192)
 
     # Prompt conditioning
-    parser.add_argument("--answer_conditioned", action="store_true",
-                        help="Include the correct answer in the prompt for both "
-                             "base and power sampling")
+    cond_group = parser.add_mutually_exclusive_group()
+    cond_group.add_argument(
+        "--answer_conditioned", action="store_true",
+        help="Include the correct answer in the prompt for both "
+             "base and power sampling",
+    )
+    cond_group.add_argument(
+        "--base_answer_conditioned", action="store_true",
+        help="Only base sees the correct answer; power sampling does not. "
+             "Compares answer-conditioned base (SDFT teacher proxy) vs "
+             "unconditioned power distribution.",
+    )
 
     # Workflow control
     parser.add_argument("--generate_only", action="store_true",
@@ -576,6 +608,10 @@ def main():
             problems = random.sample(problems, args.num_samples)
             print(f"Subsampled to {len(problems)} problems (seed={args.seed})")
 
+        # Resolve per-method conditioning flags
+        base_ac = args.answer_conditioned or args.base_answer_conditioned
+        power_ac = args.answer_conditioned  # only True when both are conditioned
+
         pairs = generate_solutions(
             model_name=args.model,
             problems=problems,
@@ -590,12 +626,18 @@ def main():
             max_model_len=args.max_model_len,
             confidence_threshold=args.confidence_threshold,
             chat_template_tokenizer=chat_template_tokenizer,
-            answer_conditioned=args.answer_conditioned,
+            base_answer_conditioned=base_ac,
+            power_answer_conditioned=power_ac,
         )
 
         # Save solutions
         model_slug = args.model.replace("/", "_")
-        subdir = "answer_conditioned" if args.answer_conditioned else "unconditioned"
+        if args.answer_conditioned:
+            subdir = "answer_conditioned"
+        elif args.base_answer_conditioned:
+            subdir = "base_answer_conditioned"
+        else:
+            subdir = "unconditioned"
         sol_dir = os.path.join(args.output_dir, args.dataset, model_slug, subdir)
         os.makedirs(sol_dir, exist_ok=True)
         sol_path = os.path.join(sol_dir, "solutions.json")
@@ -630,7 +672,12 @@ def main():
         out_dir = os.path.dirname(args.judge_from)
     else:
         model_slug = args.model.replace("/", "_")
-        subdir = "answer_conditioned" if args.answer_conditioned else "unconditioned"
+        if args.answer_conditioned:
+            subdir = "answer_conditioned"
+        elif args.base_answer_conditioned:
+            subdir = "base_answer_conditioned"
+        else:
+            subdir = "unconditioned"
         out_dir = os.path.join(args.output_dir, args.dataset, model_slug, subdir)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -644,9 +691,12 @@ def main():
     n = len(results)
     counts = _count_winners(results)
     decisive = counts["base"] + counts["power"]
+    r0 = results[0] if results else {}
     summary = {
         "judge_model": args.judge_model,
         "num_problems": n,
+        "base_answer_conditioned": r0.get("base_answer_conditioned", False),
+        "power_answer_conditioned": r0.get("power_answer_conditioned", False),
         "base_correct": sum(1 for r in results if r["base_correct"]),
         "power_correct": sum(1 for r in results if r["power_correct"]),
         "verdicts": counts,

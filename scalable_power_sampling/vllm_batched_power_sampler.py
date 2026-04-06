@@ -140,6 +140,20 @@ class VLLMBatchedPowerSampler:
                 )
             )
 
+            # Identify candidates without EOS (rollouts after EOS are
+            # meaningless — the future is empty so zeta=1, i.e. log_zeta=0,
+            # which reduces to pure low-temperature for that candidate)
+            if not skip_rollouts and self.eos_token_id is not None:
+                eos_free = [
+                    i
+                    for i, c in enumerate(top_k_chunks)
+                    if self.eos_token_id not in c
+                ]
+                if not eos_free:
+                    skip_rollouts = True
+            else:
+                eos_free = list(range(K))
+
             if skip_rollouts:
                 # Low-temperature sampling from candidates directly
                 log_unnorm = self.alpha * top_k_log_probs
@@ -148,10 +162,16 @@ class VLLMBatchedPowerSampler:
                 )
                 idx = torch.multinomial(probs, 1).item()
             else:
-                # --- Lines 6-9: Generate rollouts for each candidate ---
-                rollout_ll = self._generate_rollouts(
-                    prefix_ids, top_k_chunks
-                )  # (K, M)
+                # --- Lines 6-9: Generate rollouts for EOS-free candidates ---
+                eos_free_chunks = [top_k_chunks[i] for i in eos_free]
+                eos_free_ll = self._generate_rollouts(
+                    prefix_ids, eos_free_chunks
+                )  # (len(eos_free), M)
+
+                # Full rollout_ll: zeros for EOS candidates (log_zeta=0)
+                rollout_ll = torch.zeros(K, self.num_rollouts)
+                for j, i in enumerate(eos_free):
+                    rollout_ll[i] = eos_free_ll[j]
 
                 # --- Lines 10-16: Power distribution with jackknife ---
                 if self.use_jackknife:
@@ -262,17 +282,29 @@ class VLLMBatchedPowerSampler:
             use_tqdm=False,
         )
 
-        chunk_ids = []
-        chunk_log_probs = []
+        # Deduplicate: keep highest log-prob for each unique chunk
+        seen: dict[tuple[int, ...], int] = {}
+        deduped_ids: list[list[int]] = []
+        deduped_lps: list[float] = []
+
         for completion in outputs[0].outputs:
-            chunk_ids.append(list(completion.token_ids))
-            chunk_log_probs.append(
+            ids = list(completion.token_ids)
+            lp = (
                 completion.cumulative_logprob
                 if completion.cumulative_logprob is not None
                 else 0.0
             )
+            key = tuple(ids)
+            if key in seen:
+                idx = seen[key]
+                if lp > deduped_lps[idx]:
+                    deduped_lps[idx] = lp
+            else:
+                seen[key] = len(deduped_ids)
+                deduped_ids.append(ids)
+                deduped_lps.append(lp)
 
-        return chunk_ids, torch.tensor(chunk_log_probs)
+        return deduped_ids, torch.tensor(deduped_lps)
 
     def _generate_rollouts(
         self,

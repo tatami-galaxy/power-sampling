@@ -20,6 +20,26 @@ from scalable_power_sampling.scaling import (
 )
 
 
+def _deduplicate_tensor_rows(
+    ids: Tensor, log_probs: Tensor
+) -> Tensor:
+    """Return indices of unique rows, keeping highest log-prob per duplicate."""
+    seen: dict[tuple, int] = {}
+    unique_indices: list[int] = []
+
+    for i in range(ids.shape[0]):
+        key = tuple(ids[i].tolist())
+        if key in seen:
+            j = seen[key]
+            if log_probs[i] > log_probs[unique_indices[j]]:
+                unique_indices[j] = i
+        else:
+            seen[key] = len(unique_indices)
+            unique_indices.append(i)
+
+    return torch.tensor(unique_indices, device=ids.device, dtype=torch.long)
+
+
 class BatchedPowerSampler:
     """Batched scalable power sampling for autoregressive language models.
 
@@ -125,6 +145,13 @@ class BatchedPowerSampler:
                 self._generate_candidate_chunks(prefix_cache, prefix_logits, B)
             )
 
+            # Deduplicate candidates before top-K selection
+            unique_idx = _deduplicate_tensor_rows(chunk_ids, chunk_log_probs)
+            chunk_ids = chunk_ids[unique_idx]
+            chunk_log_probs = chunk_log_probs[unique_idx]
+            chunk_cache = _batch_select_kv_cache(chunk_cache, unique_idx)
+            chunk_logits = chunk_logits[unique_idx]
+
             # --- Line 5: Select top-K candidates by likelihood ---
             K = min(self.top_k, chunk_ids.shape[0])
             top_k_vals, top_k_idx = chunk_log_probs.topk(K)
@@ -134,15 +161,51 @@ class BatchedPowerSampler:
             top_k_logits = chunk_logits[top_k_idx]     # (K, vocab_size)
             del chunk_cache
 
-            if self.alpha == 1.0:
-                # No sharpening: sample proportional to base likelihood
-                probs = torch.exp(top_k_log_probs - torch.logsumexp(top_k_log_probs, dim=-1))
+            # Determine whether to skip rollouts
+            skip_rollouts = self.alpha == 1.0
+
+            # Identify candidates without EOS (rollouts after EOS are
+            # meaningless — the future is empty so zeta=1, reducing to
+            # pure low-temperature for that candidate)
+            if not skip_rollouts and self.eos_token_id is not None:
+                eos_free = [
+                    i
+                    for i in range(K)
+                    if not (top_k_ids[i] == self.eos_token_id).any()
+                ]
+                if not eos_free:
+                    skip_rollouts = True
+            else:
+                eos_free = list(range(K))
+
+            if skip_rollouts:
+                # No sharpening or all candidates contain EOS:
+                # low-temperature sampling
+                log_unnorm = self.alpha * top_k_log_probs
+                probs = torch.exp(
+                    log_unnorm - torch.logsumexp(log_unnorm, dim=-1)
+                )
                 idx = torch.multinomial(probs, 1).item()
             else:
-                # --- Lines 6-9: Generate rollouts for each candidate ---
-                rollout_ll = self._generate_chunk_rollouts(
-                    top_k_cache, top_k_logits
-                )  # (K, M)
+                # --- Lines 6-9: Generate rollouts for EOS-free candidates ---
+                eos_free_idx = torch.tensor(
+                    eos_free, device=self.device, dtype=torch.long
+                )
+                eos_free_cache = _batch_select_kv_cache(
+                    top_k_cache, eos_free_idx
+                )
+                eos_free_logits = top_k_logits[eos_free_idx]
+
+                eos_free_ll = self._generate_chunk_rollouts(
+                    eos_free_cache, eos_free_logits
+                )  # (len(eos_free), M)
+
+                # Full rollout_ll: zeros for EOS candidates (log_zeta=0)
+                rollout_ll = torch.zeros(
+                    K, self.num_rollouts, device=self.device
+                )
+                for j, i in enumerate(eos_free):
+                    rollout_ll[i] = eos_free_ll[j]
 
                 # --- Lines 10-16: Power distribution with jackknife ---
                 if self.use_jackknife:
@@ -188,6 +251,10 @@ class BatchedPowerSampler:
             chunk_ids, chunk_log_probs, _, _ = self._generate_candidate_chunks(
                 prefix_cache, prefix_logits, remainder
             )
+            unique_idx = _deduplicate_tensor_rows(chunk_ids, chunk_log_probs)
+            chunk_ids = chunk_ids[unique_idx]
+            chunk_log_probs = chunk_log_probs[unique_idx]
+
             K = min(self.top_k, chunk_ids.shape[0])
             top_k_vals, top_k_idx = chunk_log_probs.topk(K)
             top_k_ids = chunk_ids[top_k_idx]
