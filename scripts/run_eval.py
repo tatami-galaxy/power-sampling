@@ -147,6 +147,11 @@ def evaluate_model_power_sampling(
     batch_size: int = 8,
     num_candidates: int = 32,
     use_vllm: bool = False,
+    use_smc: bool = False,
+    n_particles: int = 64,
+    ess_threshold: float = 0.5,
+    smc_block_size: int = 64,
+    alpha_ramp_tokens: int = 100,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     confidence_threshold: float | None = None,
@@ -156,7 +161,9 @@ def evaluate_model_power_sampling(
     import torch
     from tqdm import tqdm
 
-    if use_vllm:
+    if use_smc:
+        method = "smc_power_sampling"
+    elif use_vllm:
         method = "vllm_batched_power_sampling"
     elif batched:
         method = "batched_power_sampling"
@@ -165,11 +172,15 @@ def evaluate_model_power_sampling(
 
     print(f"\n{'='*60}")
     print(f"Evaluating ({method}): {model_name}")
-    print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
-    if batched or use_vllm:
-        print(f"  B={batch_size}, L={num_candidates}")
-    if confidence_threshold is not None:
-        print(f"  confidence_threshold={confidence_threshold}")
+    if use_smc:
+        print(f"  alpha={alpha}, N={n_particles}, ESS_thresh={ess_threshold}")
+        print(f"  block_size={smc_block_size}, alpha_ramp_tokens={alpha_ramp_tokens}")
+    else:
+        print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
+        if batched or use_vllm:
+            print(f"  B={batch_size}, L={num_candidates}")
+        if confidence_threshold is not None:
+            print(f"  confidence_threshold={confidence_threshold}")
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
 
@@ -192,7 +203,6 @@ def evaluate_model_power_sampling(
         tokenizer = sampler.tokenizer
     else:
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from scalable_power_sampling import BatchedPowerSampler, PowerSampler
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -203,7 +213,22 @@ def evaluate_model_power_sampling(
             trust_remote_code=True,
         )
 
-        if batched:
+        if use_smc:
+            from scalable_power_sampling import SMCPowerSampler
+
+            sampler = SMCPowerSampler(
+                model=model,
+                tokenizer=tokenizer,
+                alpha=alpha,
+                n_particles=n_particles,
+                ess_threshold=ess_threshold,
+                block_size=smc_block_size,
+                alpha_ramp_tokens=alpha_ramp_tokens,
+                max_new_tokens=max_tokens,
+            )
+        elif batched:
+            from scalable_power_sampling import BatchedPowerSampler
+
             sampler = BatchedPowerSampler(
                 model=model,
                 tokenizer=tokenizer,
@@ -216,6 +241,8 @@ def evaluate_model_power_sampling(
                 max_new_tokens=max_tokens,
             )
         else:
+            from scalable_power_sampling import PowerSampler
+
             sampler = PowerSampler(
                 model=model,
                 tokenizer=tokenizer,
@@ -271,15 +298,22 @@ def evaluate_model_power_sampling(
     elapsed = time.time() - t0
     print(f"{method} took {elapsed:.1f}s total")
 
-    config = {
-        "alpha": alpha, "top_k": top_k,
-        "num_rollouts": num_rollouts, "lookahead": lookahead,
-    }
-    if batched or use_vllm:
-        config["batch_size"] = batch_size
-        config["num_candidates"] = num_candidates
-    if confidence_threshold is not None:
-        config["confidence_threshold"] = confidence_threshold
+    if use_smc:
+        config = {
+            "alpha": alpha, "n_particles": n_particles,
+            "ess_threshold": ess_threshold, "block_size": smc_block_size,
+            "alpha_ramp_tokens": alpha_ramp_tokens,
+        }
+    else:
+        config = {
+            "alpha": alpha, "top_k": top_k,
+            "num_rollouts": num_rollouts, "lookahead": lookahead,
+        }
+        if batched or use_vllm:
+            config["batch_size"] = batch_size
+            config["num_candidates"] = num_candidates
+        if confidence_threshold is not None:
+            config["confidence_threshold"] = confidence_threshold
 
     return {
         "model": model_name,
@@ -441,6 +475,19 @@ def main():
                         help="Use vLLM backend for power sampling (much faster, implies --batched)")
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
+
+    # SMC power sampling options
+    parser.add_argument("--use_smc", action="store_true",
+                        help="Use Power-SMC (particle-based) instead of rollout-based power sampling")
+    parser.add_argument("--n_particles", type=int, default=64,
+                        help="Number of SMC particles (N)")
+    parser.add_argument("--ess_threshold", type=float, default=0.5,
+                        help="Resample when ESS < threshold * N")
+    parser.add_argument("--smc_block_size", type=int, default=64,
+                        help="Check ESS every this many tokens")
+    parser.add_argument("--alpha_ramp_tokens", type=int, default=100,
+                        help="Linear alpha ramp from 1 to target over this many tokens (0 to disable)")
+
     parser.add_argument("--chat_template_model", type=str, default=None,
                         help="Load chat template from this model (e.g. the instruct variant) "
                              "for base models that lack one")
@@ -502,6 +549,11 @@ def main():
                 batch_size=args.batch_size,
                 num_candidates=args.num_candidates,
                 use_vllm=args.use_vllm,
+                use_smc=args.use_smc,
+                n_particles=args.n_particles,
+                ess_threshold=args.ess_threshold,
+                smc_block_size=args.smc_block_size,
+                alpha_ramp_tokens=args.alpha_ramp_tokens,
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len or None,
                 confidence_threshold=args.confidence_threshold,
