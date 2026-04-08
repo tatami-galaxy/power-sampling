@@ -477,7 +477,6 @@ def main():
     parser.add_argument("--num_generations", type=int, default=8,
                         help="Number of completions per prompt")
     parser.add_argument("--max_completion_length", type=int, default=4096)
-    parser.add_argument("--max_prompt_length", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0,
                         help="KL penalty coefficient (0 = no KL)")
