@@ -39,11 +39,10 @@ Usage:
     # Multi GPU
     CUDA_VISIBLE_DEVICES=4,5,6,7 uv run accelerate launch \
         --config_file configs/multi_gpu_4.yaml \
-        -m src.train.train_rl --model Qwen/Qwen3-4B \
-        --dataset deepmath --max_steps 1000 --logging_steps 10 \
+        -m scripts.rl.train_grpo_monitor --model Qwen/Qwen3-4B \
+        --dataset deepmath --max_steps 1000 --logging_steps 50 \
         --save_steps 50 --gradient_accumulation_steps 4 \
-        --save_total_limit 3 --per_device_batch_size 1 \
-        --lr_scheduler_type constant 
+         --per_device_batch_size 1 --lr_scheduler_type constant 
 """
 
 import argparse
@@ -275,8 +274,8 @@ def format_grpo(example):
         {"role": "user", "content": example["problem"]},
     ]
     result = {"prompt": prompt, "answer": example["answer"]}
-    if "difficulty" in example and example["difficulty"] is not None:
-        result["difficulty"] = example["difficulty"]
+    if "difficulty" in example:
+        result["difficulty"] = example.get("difficulty")
     return result
 
 

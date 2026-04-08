@@ -41,7 +41,7 @@ class MonitoredReward:
                 "word_count": wc,
                 "total_markers": total,
                 "density_per_1k": (total / wc * 1000) if wc > 0 else 0.0,
-                "difficulty": str(difficulty[i]) if difficulty is not None else None,
+                "difficulty": str(difficulty[i]) if difficulty is not None and difficulty[i] is not None else None,
             })
         return rewards
 
