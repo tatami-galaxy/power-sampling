@@ -318,7 +318,7 @@ def generate_for_alpha_sweep(
     levels: list[int] | None,
 ) -> list[tuple[str, str]]:
     """Generate results for base + each alpha value. Returns (path, label) pairs."""
-    from scripts.run_eval import (
+    from scripts.eval.run_eval import (
         evaluate_model,
         evaluate_model_power_sampling,
         save_results,
@@ -424,7 +424,7 @@ def generate_teacher_conditioned(
 
     Returns (results_path, label).
     """
-    from scripts.run_eval import save_results
+    from scripts.eval.run_eval import save_results
     from scripts.train_sdft import (
         SYSTEM_PROMPT as SDFT_SYSTEM_PROMPT,
         TEACHER_TEMPLATE_1,
