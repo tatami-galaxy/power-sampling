@@ -3,9 +3,6 @@ GRPO training on NuminaMath-1.5, Polaris-Dataset-53K, or DeepMath-103K using TRL
 
 Outcome-based reward: +1 if the model's boxed answer matches the gold answer, 0 otherwise.
 
-Saves initial model weights (theta_init) alongside checkpoints
-for post-hoc sparsity analysis (|theta_final - theta_init| <= 10^-5).
-
 Usage:
     python -m src.train.train_rl \
         --model meta-llama/Llama-3.1-8B-Instruct \
@@ -280,29 +277,6 @@ def format_grpo(example):
 
 
 # ---------------------------------------------------------------------------
-# Initial weight snapshot
-# ---------------------------------------------------------------------------
-
-def save_theta_init(model: AutoModelForCausalLM, output_dir: str):
-    """Save initial model weights for sparsity analysis. Only runs on main process."""
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank != 0:
-        return
-
-    theta_init_dir = os.path.join(output_dir, "theta_init")
-    os.makedirs(theta_init_dir, exist_ok=True)
-
-    model.save_pretrained(theta_init_dir, safe_serialization=True)
-
-    # Remove non-weight files to save space
-    for fname in os.listdir(theta_init_dir):
-        if not fname.endswith((".safetensors", ".bin", ".pt")):
-            os.remove(os.path.join(theta_init_dir, fname))
-
-    print(f"Saved initial weights to {theta_init_dir}")
-
-
-# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -328,8 +302,6 @@ def train(args):
 
     # Save initial weights before any training (skip for LoRA)
     args.output_dir = args.output_dir + '/' + args.dataset + '/' + args.model.replace('/', '_')
-    if not args.use_lora:
-        save_theta_init(model, args.output_dir)
 
     # LoRA config
     peft_config = None
