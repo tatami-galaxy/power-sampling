@@ -438,9 +438,6 @@ def train(args):
     # Train
     trainer.train()
 
-    # Save final model
-    trainer.save_model(os.path.join(args.output_dir, "final"))
-
     # Save training config for reproducibility
     config_path = os.path.join(args.output_dir, "train_config.json")
     with open(config_path, "w") as f:
