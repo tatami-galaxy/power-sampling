@@ -123,6 +123,10 @@ class TraceMonitorCallback(TrainerCallback):
         metrics["monitor/response_length_std"] = float(np.std(lengths))
         metrics["monitor/solve_rate"] = float(np.mean(rewards))
 
+        correct_lengths = [e["word_count"] for e in entries if e["reward"] > 0]
+        if correct_lengths:
+            metrics["monitor/correct_response_length"] = float(np.mean(correct_lengths))
+
         # ----- Per-prompt group metrics -----
         G = self.num_generations
         num_prompts = len(entries) // G
