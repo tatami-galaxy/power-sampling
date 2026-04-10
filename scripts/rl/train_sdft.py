@@ -559,14 +559,32 @@ def train(args):
         p.requires_grad_(False)
 
     # Output dir
-    args.output_dir = f"{args.output_dir}/{args.dataset}/{args.model.split('/')[-1]}"
+    if args.demo_file:
+        demo_name = os.path.splitext(os.path.basename(args.demo_file))[0]
+        args.output_dir = f"{args.output_dir}/{demo_name}/{args.model.split('/')[-1]}"
+    else:
+        args.output_dir = f"{args.output_dir}/{args.dataset}/{args.model.split('/')[-1]}"
 
     # ── Dataset ──────────────────────────────────────────────────────────────
-    if args.dataset == "openthoughts":
+    if args.demo_file:
+        from datasets import load_dataset as _load_ds
+        ds = _load_ds("json", data_files=args.demo_file, split="train")
+        # Filter to correct demos only (power-sampled JSONL has a "correct" field)
+        if "correct" in ds.column_names:
+            pre = len(ds)
+            ds = ds.filter(lambda x: x["correct"], num_proc=4)
+            print(f"Filtered to correct demos: {pre} → {len(ds)}")
+        if args.max_samples and args.max_samples < len(ds):
+            ds = ds.shuffle(seed=args.seed).select(range(args.max_samples))
+        print(f"Loaded {len(ds)} demos from {args.demo_file}")
+    elif args.dataset == "openthoughts":
         ds = load_openthoughts(max_samples=args.max_samples, seed=args.seed)
     elif args.dataset == "deepmath":
         ds = load_deepmath(max_samples=args.max_samples, seed=args.seed)
-    print(f"Loaded {len(ds)} training examples from {args.dataset}")
+    else:
+        raise ValueError(f"Provide --demo_file or a valid --dataset")
+    if not args.demo_file:
+        print(f"Loaded {len(ds)} training examples from {args.dataset}")
 
     train_ds = ds.map(
         format_sdft,
@@ -703,6 +721,9 @@ def main():
                         help="Training dataset: 'numinamath' (AI-MO/NuminaMath-1.5), "
                              "'competition_math' (qwedsacf/competition_math), "
                              "or 'deepmath' (zwhe99/DeepMath-103K)")
+    parser.add_argument("--demo_file", type=str, default=None,
+                        help="JSONL file with power-sampled demos (problem, solution, answer). "
+                             "Overrides --dataset. Auto-filters to correct=True.")
     parser.add_argument("--max_samples", type=int, default=None)
 
     # Generation (on-policy sampling)
