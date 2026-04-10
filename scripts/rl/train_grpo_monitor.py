@@ -363,8 +363,8 @@ def train(args):
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps,
@@ -375,6 +375,7 @@ def train(args):
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         beta=args.beta,
+        loss_type=args.loss_type,
         # vLLM
         use_vllm=args.use_vllm,
         vllm_mode="colocate",
@@ -477,6 +478,9 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0,
                         help="KL penalty coefficient (0 = no KL)")
+    parser.add_argument("--loss_type", type=str, default="dr_grpo",
+                        choices=["grpo", "dapo", "bnpo", "dr_grpo", "cispo", "sapo", "luspo", "vespo"],
+                        help="GRPO loss formulation (default: dapo)")
 
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
@@ -504,6 +508,8 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--per_device_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to reduce memory usage")
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--lr_scheduler_type", type=str, default="constant")
     parser.add_argument("--warmup_steps", type=int, default=10)
