@@ -569,11 +569,6 @@ def train(args):
     if args.demo_file:
         from datasets import load_dataset as _load_ds
         ds = _load_ds("json", data_files=args.demo_file, split="train")
-        # Filter to correct demos only (power-sampled JSONL has a "correct" field)
-        if "correct" in ds.column_names:
-            pre = len(ds)
-            ds = ds.filter(lambda x: x["correct"], num_proc=4)
-            print(f"Filtered to correct demos: {pre} → {len(ds)}")
         if args.max_samples and args.max_samples < len(ds):
             ds = ds.shuffle(seed=args.seed).select(range(args.max_samples))
         print(f"Loaded {len(ds)} demos from {args.demo_file}")
