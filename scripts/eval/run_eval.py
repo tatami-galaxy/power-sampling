@@ -118,7 +118,8 @@ def evaluate_model(
     # Score
     results = []
     for prob, output in zip(problems, outputs):
-        response = output.outputs[0].text
+        completion = output.outputs[0]
+        response = completion.text
         pred_answer = extract_boxed_answer(response)
         correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
         results.append({
@@ -126,6 +127,7 @@ def evaluate_model(
             "response": response,
             "pred_answer": pred_answer,
             "correct": correct,
+            "num_tokens_generated": len(completion.token_ids),
         })
 
     return {
@@ -338,6 +340,22 @@ def print_report(eval_output: dict):
     print(f"\n{'='*60}")
     print(f"Results: {model}")
     print(f"Overall: {correct}/{total} = {correct/total*100:.1f}%")
+
+    lens = [r["num_tokens_generated"] for r in results if "num_tokens_generated" in r]
+    if lens:
+        correct_lens = [
+            r["num_tokens_generated"] for r in results
+            if "num_tokens_generated" in r and r["correct"]
+        ]
+        incorrect_lens = [
+            r["num_tokens_generated"] for r in results
+            if "num_tokens_generated" in r and not r["correct"]
+        ]
+        print(f"Avg tokens generated: {sum(lens)/len(lens):.1f} (n={len(lens)})")
+        if correct_lens:
+            print(f"  correct:   {sum(correct_lens)/len(correct_lens):.1f} (n={len(correct_lens)})")
+        if incorrect_lens:
+            print(f"  incorrect: {sum(incorrect_lens)/len(incorrect_lens):.1f} (n={len(incorrect_lens)})")
     print(f"{'='*60}")
 
     # By level
@@ -397,12 +415,29 @@ def save_results(eval_output: dict, output_dir: str):
         by_subject[r["subject"]]["total"] += 1
         by_subject[r["subject"]]["correct"] += int(r["correct"])
 
+    lens = [r["num_tokens_generated"] for r in results if "num_tokens_generated" in r]
+    correct_lens = [
+        r["num_tokens_generated"] for r in results
+        if "num_tokens_generated" in r and r["correct"]
+    ]
+    incorrect_lens = [
+        r["num_tokens_generated"] for r in results
+        if "num_tokens_generated" in r and not r["correct"]
+    ]
+
     summary = {
         "model": eval_output["model"],
         "method": eval_output.get("method", "greedy"),
         "dataset_size": total,
         "overall_accuracy": correct / total if total else 0,
         "elapsed_s": eval_output["elapsed_s"],
+        "avg_tokens_generated": sum(lens) / len(lens) if lens else None,
+        "avg_tokens_correct": (
+            sum(correct_lens) / len(correct_lens) if correct_lens else None
+        ),
+        "avg_tokens_incorrect": (
+            sum(incorrect_lens) / len(incorrect_lens) if incorrect_lens else None
+        ),
         "by_level": {
             str(k): {**v, "accuracy": v["correct"] / v["total"] if v["total"] else 0}
             for k, v in sorted(by_level.items())
