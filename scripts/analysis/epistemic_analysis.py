@@ -316,6 +316,7 @@ def generate_for_alpha_sweep(
     chat_template_model: str | None,
     output_dir: str,
     levels: list[int] | None,
+    enable_thinking: bool | None = None,
 ) -> list[tuple[str, str]]:
     """Generate results for base + each alpha value. Returns (path, label) pairs."""
     from scripts.eval.run_eval import (
@@ -358,6 +359,7 @@ def generate_for_alpha_sweep(
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len or None,
             chat_template_tokenizer=chat_template_tokenizer,
+            enable_thinking=enable_thinking,
         )
         save_results(eval_out, base_dir)
     result_files.append((base_path, "base (α=1)"))
@@ -388,6 +390,7 @@ def generate_for_alpha_sweep(
                 tensor_parallel_size=tensor_parallel_size,
                 max_model_len=max_model_len or None,
                 chat_template_tokenizer=chat_template_tokenizer,
+                enable_thinking=enable_thinking,
             )
             os.makedirs(alpha_dir, exist_ok=True)
             save_results(ps_out, alpha_dir)
@@ -414,6 +417,7 @@ def generate_teacher_conditioned(
     levels: list[int] | None,
     teacher_template: int,
     problems: list[dict] | None = None,
+    enable_thinking: bool | None = None,
 ) -> tuple[str, str]:
     """Generate responses under the SDFT teacher context (question + solution).
 
@@ -475,6 +479,10 @@ def generate_teacher_conditioned(
             model_name, trust_remote_code=True
         )
 
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = enable_thinking
+
     prompts = []
     for p in problems:
         solution = p["solution"].strip()
@@ -487,9 +495,7 @@ def generate_teacher_conditioned(
                 question=p["problem"], demonstration=solution,
             )},
         ]
-        text = template_tok.apply_chat_template(
-            teacher_messages, tokenize=False, add_generation_prompt=True,
-        )
+        text = template_tok.apply_chat_template(teacher_messages, **template_kwargs)
         prompts.append(text)
 
     # ── Generate ─────────────────────────────────────────────────────────────
@@ -621,6 +627,11 @@ def main():
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--max_model_len", type=int, default=4096)
     parser.add_argument("--chat_template_model", type=str, default=None)
+    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="For models with a toggleable thinking mode (e.g. Qwen3): "
+                             "pass --enable-thinking or --no-enable-thinking to override "
+                             "the template default. Leave unset to use the model default.")
 
     # Output
     parser.add_argument("--output_dir", default="results")
@@ -656,6 +667,7 @@ def main():
             chat_template_model=args.chat_template_model,
             output_dir=args.output_dir,
             levels=args.levels,
+            enable_thinking=args.enable_thinking,
         )
 
         # Teacher-conditioned generation (SDFT self-teacher)
@@ -683,6 +695,7 @@ def main():
                 levels=args.levels,
                 teacher_template=args.teacher_template,
                 problems=problems,
+                enable_thinking=args.enable_thinking,
             )
             result_files.append((teacher_path, teacher_label))
     elif args.results_dir:

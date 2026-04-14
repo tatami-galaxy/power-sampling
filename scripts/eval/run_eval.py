@@ -76,6 +76,7 @@ def evaluate_model(
     tensor_parallel_size: int = 1,
     max_model_len: int | None = 4096,
     chat_template_tokenizer=None,
+    enable_thinking: bool | None = None,
 ) -> dict:
     """Run evaluation and return results dict."""
     print(f"\n{'='*60}")
@@ -101,12 +102,13 @@ def evaluate_model(
 
     # Build prompts
     template_tok = chat_template_tokenizer or tokenizer
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = enable_thinking
     prompts = []
     for p in problems:
         messages = format_prompt(p["problem"])
-        text = template_tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        text = template_tok.apply_chat_template(messages, **template_kwargs)
         prompts.append(text)
 
     # Generate
@@ -158,6 +160,7 @@ def evaluate_model_power_sampling(
     max_model_len: int = 4096,
     confidence_threshold: float | None = None,
     chat_template_tokenizer=None,
+    enable_thinking: bool | None = None,
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
@@ -259,13 +262,14 @@ def evaluate_model_power_sampling(
     t0 = time.time()
 
     template_tok = chat_template_tokenizer or tokenizer
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = enable_thinking
     correct_so_far = 0
     pbar = tqdm(problems, desc=method, unit="problem")
     for i, prob in enumerate(pbar):
         messages = format_prompt(prob["problem"])
-        prompt_text = template_tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt_text = template_tok.apply_chat_template(messages, **template_kwargs)
 
         if use_vllm:
             input_ids = tokenizer.encode(prompt_text)
@@ -526,6 +530,11 @@ def main():
     parser.add_argument("--chat_template_model", type=str, default=None,
                         help="Load chat template from this model (e.g. the instruct variant) "
                              "for base models that lack one")
+    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="For models with a toggleable thinking mode (e.g. Qwen3): "
+                             "pass --enable-thinking or --no-enable-thinking to override "
+                             "the template default. Leave unset to use the model default.")
 
     args = parser.parse_args()
 
@@ -566,6 +575,7 @@ def main():
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len or None,
             chat_template_tokenizer=chat_template_tokenizer,
+            enable_thinking=args.enable_thinking,
         )
         print_report(eval_output)
         save_results(eval_output, output_dir)
@@ -593,6 +603,7 @@ def main():
                 max_model_len=args.max_model_len or None,
                 confidence_threshold=args.confidence_threshold,
                 chat_template_tokenizer=chat_template_tokenizer,
+                enable_thinking=args.enable_thinking,
             )
             print_report(ps_output)
             ps_dir = output_dir + "/" + ps_output["method"]
