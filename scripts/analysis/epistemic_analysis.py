@@ -531,7 +531,15 @@ def generate_teacher_conditioned(
 
     # ── Save ──────────────────────────────────────────────────────────────────
     os.makedirs(teacher_dir, exist_ok=True)
-    save_results({"model": model_name, "results": results, "elapsed_s": elapsed}, teacher_dir)
+    save_results(
+        {
+            "model": model_name,
+            "results": results,
+            "elapsed_s": elapsed,
+            "max_tokens": max_tokens,
+        },
+        teacher_dir,
+    )
     print(f"Saved teacher results: {results_path}")
 
     # Clean up GPU memory before returning
@@ -596,7 +604,7 @@ def main():
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument(
         "--dataset", default="math500",
-        help="Dataset name (math500, minerva_math, aime_2025)",
+        help="Dataset name (math500, minerva_math, aime24, aime25, aime26, aime_2025)",
     )
     parser.add_argument("--levels", nargs="*", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=None)

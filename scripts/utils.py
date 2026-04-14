@@ -157,6 +157,55 @@ def load_aime_2025(levels: list[int] | None = None) -> list[dict]:
     return out
 
 
+@register_dataset_eval("aime24")
+def load_aime24(levels: list[int] | None = None) -> list[dict]:
+    ds = load_dataset("math-ai/aime24", split="test")
+    out = []
+    for row in ds:
+        answer = extract_boxed_answer(row["solution"]) or ""
+        out.append({
+            "problem": row["problem"],
+            "answer": answer,
+            "solution": row["solution"],
+            "level": 0,
+            "subject": "",
+            "unique_id": f"aime24_{row['id']}",
+        })
+    return out
+
+
+@register_dataset_eval("aime25")
+def load_aime25(levels: list[int] | None = None) -> list[dict]:
+    ds = load_dataset("math-ai/aime25", split="test")
+    out = []
+    for row in ds:
+        out.append({
+            "problem": row["problem"],
+            "answer": str(row["answer"]),
+            "solution": "",
+            "level": 0,
+            "subject": "",
+            "unique_id": f"aime25_{row['id']}",
+        })
+    return out
+
+
+@register_dataset_eval("aime26")
+def load_aime26(levels: list[int] | None = None) -> list[dict]:
+    ds = load_dataset("MathArena/aime_2026", split="train")
+    out = []
+    for row in ds:
+        out.append({
+            "problem": row["problem"],
+            "answer": str(row["answer"]),
+            "solution": "",
+            "level": 0,
+            "subject": "",
+            "unique_id": f"aime26_{row['problem_idx']}",
+        })
+    return out
+
+
 @register_dataset_eval("math500")
 def load_math500(levels: list[int] | None = None) -> list[dict]:
     ds = load_dataset("HuggingFaceH4/MATH-500", split="test")

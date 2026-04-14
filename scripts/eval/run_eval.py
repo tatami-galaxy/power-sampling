@@ -136,6 +136,7 @@ def evaluate_model(
         "model": model_name,
         "results": results,
         "elapsed_s": elapsed,
+        "max_tokens": max_tokens,
     }
 
 
@@ -327,6 +328,7 @@ def evaluate_model_power_sampling(
         "power_sampling_config": config,
         "results": results,
         "elapsed_s": elapsed,
+        "max_tokens": max_tokens,
     }
 
 
@@ -435,6 +437,7 @@ def save_results(eval_output: dict, output_dir: str):
         "dataset_size": total,
         "overall_accuracy": correct / total if total else 0,
         "elapsed_s": eval_output["elapsed_s"],
+        "max_tokens": eval_output.get("max_tokens"),
         "avg_tokens_generated": sum(lens) / len(lens) if lens else None,
         "avg_tokens_correct": (
             sum(correct_lens) / len(correct_lens) if correct_lens else None
