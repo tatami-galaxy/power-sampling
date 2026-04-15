@@ -29,12 +29,14 @@ Usage:
 """
 
 import argparse
+import contextlib
 import copy
 import json
 import os
 import warnings
 
 import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 try:
     from openai import OpenAI as _OpenAI
@@ -228,12 +230,20 @@ class EMACallback(TrainerCallback):
         self.teacher_model.to(device)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        # Unwrap DDP if needed.
-        student = model.module if hasattr(model, "module") else model
         alpha = self.ema_alpha
-        with torch.no_grad():
-            for ps, pt in zip(student.parameters(), self.teacher_model.parameters()):
-                pt.data.mul_(1.0 - alpha).add_(ps.data, alpha=alpha)
+        # Under FSDP, summon full (unsharded) params so each rank sees the
+        # original 2-D shapes and applies the identical EMA update to its
+        # replicated teacher copy.
+        summon_ctx = (
+            FSDP.summon_full_params(model, writeback=False, recurse=True)
+            if isinstance(model, FSDP)
+            else contextlib.nullcontext()
+        )
+        with summon_ctx:
+            student = model.module if hasattr(model, "module") else model
+            with torch.no_grad():
+                for ps, pt in zip(student.parameters(), self.teacher_model.parameters()):
+                    pt.data.mul_(1.0 - alpha).add_(ps.data, alpha=alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +429,12 @@ class SDFTTrainer(Trainer):
                 left_ids[i, Ls - L:]  = s_ids[i, :L]
                 left_mask[i, Ls - L:] = 1
 
-            with torch.no_grad():
+            gen_ctx = (
+                FSDP.summon_full_params(model, writeback=False, recurse=True)
+                if isinstance(model, FSDP)
+                else contextlib.nullcontext()
+            )
+            with torch.no_grad(), gen_ctx:
                 gen_out = _unwrap_model(model).generate(
                     left_ids,
                     attention_mask=left_mask,
@@ -458,7 +473,7 @@ class SDFTTrainer(Trainer):
         # ── 3. Teacher forward (no grad) ──────────────────────────────────────
         with torch.no_grad():
             t_logits = self.teacher_model(
-                input_ids=tf_ids, attention_mask=tf_mask
+                input_ids=tf_ids, attention_mask=tf_mask, use_cache=False,
             ).logits  # [B, L_t, V]
             teacher_log_p = torch.log_softmax(
                 t_logits[:, :-1, :][comp_t].float(), dim=-1
@@ -466,7 +481,9 @@ class SDFTTrainer(Trainer):
             del t_logits
 
         # ── 4. Student forward (with grad) ────────────────────────────────────
-        s_logits = model(input_ids=sf_ids, attention_mask=sf_mask).logits  # [B, L_s, V]
+        s_logits = model(
+            input_ids=sf_ids, attention_mask=sf_mask, use_cache=False,
+        ).logits  # [B, L_s, V]
         student_log_p = torch.log_softmax(
             s_logits[:, :-1, :][comp_s].float(), dim=-1
         )  # [N, V]
