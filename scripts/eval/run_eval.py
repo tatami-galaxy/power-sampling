@@ -505,7 +505,7 @@ def main():
                         help="Top-K candidates per step for power sampling")
     parser.add_argument("--num_rollouts", type=int, default=8,
                         help="Rollouts per candidate for power sampling")
-    parser.add_argument("--lookahead", type=int, default=32,
+    parser.add_argument("--lookahead", type=int, default=192,
                         help="Rollout horizon in tokens for power sampling")
     parser.add_argument("--batched", action="store_true",
                         help="Use batched power sampling (Algorithm 2) instead of single-token")
