@@ -268,15 +268,29 @@ class VLLMWeightSyncCallback(TrainerCallback):
         self.checkpoint_dir = checkpoint_dir
         self.sync_steps = sync_steps
         self.vllm_client = vllm_client
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if int(os.environ.get("RANK", 0)) == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if state.global_step == 0 or state.global_step % self.sync_steps != 0:
             return
 
-        student = model.module if hasattr(model, "module") else model
-        student.save_pretrained(self.checkpoint_dir)
-        print(f"[VLLMSync step {state.global_step}] Saved weights → {self.checkpoint_dir}")
+        rank = int(os.environ.get("RANK", 0))
+        # Under FSDP we must all-gather full params across ranks, then save
+        # from rank 0 only. Under DDP, params are already replicated.
+        summon_ctx = (
+            FSDP.summon_full_params(model, writeback=False, recurse=True, offload_to_cpu=True, rank0_only=True)
+            if isinstance(model, FSDP)
+            else contextlib.nullcontext()
+        )
+        with summon_ctx:
+            if rank == 0:
+                student = model.module if hasattr(model, "module") else model
+                student.save_pretrained(self.checkpoint_dir)
+                print(f"[VLLMSync step {state.global_step}] Saved weights → {self.checkpoint_dir}")
+
+        if rank != 0:
+            return
 
         if self.vllm_client is not None:
             try:
