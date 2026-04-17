@@ -107,53 +107,43 @@ def generate_rollouts(
     return rollout_log_likelihoods, past_key_values
 
 
-def _expand_kv_cache(past_key_values, n: int):
-    """Repeat each KV-cache tensor n times along the batch dimension."""
+def _transform_cache(past_key_values, fn):
+    """Apply `fn` to each layer's (keys, values) and rebuild a DynamicCache.
+
+    Iteration over a transformers>=5 `Cache` yields
+    `(keys, values, sliding_window_tensor_or_None)` per layer; earlier versions
+    yielded `(keys, values)`. The `DynamicCache(ddp_cache_data=...)` constructor
+    accepts either arity, so we forward the sliding-window tensor through
+    unchanged when present.
+    """
     if isinstance(past_key_values, Cache):
-        expanded_data = [
-            (keys.repeat_interleave(n, dim=0), values.repeat_interleave(n, dim=0))
-            for keys, values in past_key_values
-        ]
-        return DynamicCache(ddp_cache_data=expanded_data)
+        data = []
+        for entry in past_key_values:
+            keys, values = entry[0], entry[1]
+            new_keys, new_values = fn(keys), fn(values)
+            if len(entry) == 3 and entry[2] is not None:
+                data.append((new_keys, new_values, entry[2]))
+            else:
+                data.append((new_keys, new_values))
+        return DynamicCache(ddp_cache_data=data)
 
     # Legacy tuple-of-tuples format
-    expanded = []
-    for layer_past in past_key_values:
-        expanded.append(
-            tuple(t.repeat_interleave(n, dim=0) for t in layer_past)
-        )
-    return type(past_key_values)(expanded) if not isinstance(past_key_values, list) else expanded
+    transformed = [tuple(fn(t) for t in layer_past) for layer_past in past_key_values]
+    if isinstance(past_key_values, list):
+        return transformed
+    return type(past_key_values)(transformed)
+
+
+def _expand_kv_cache(past_key_values, n: int):
+    """Repeat each KV-cache tensor n times along the batch dimension."""
+    return _transform_cache(past_key_values, lambda t: t.repeat_interleave(n, dim=0))
 
 
 def _select_kv_cache(past_key_values, index: int):
     """Select a single batch element from a KV-cache."""
-    if isinstance(past_key_values, Cache):
-        selected_data = [
-            (keys[index : index + 1].clone(), values[index : index + 1].clone())
-            for keys, values in past_key_values
-        ]
-        return DynamicCache(ddp_cache_data=selected_data)
-
-    # Legacy tuple-of-tuples format
-    selected = []
-    for layer_past in past_key_values:
-        selected.append(
-            tuple(t[index : index + 1] for t in layer_past)
-        )
-    return type(past_key_values)(selected) if not isinstance(past_key_values, list) else selected
+    return _transform_cache(past_key_values, lambda t: t[index : index + 1].clone())
 
 
 def _batch_select_kv_cache(past_key_values, indices: Tensor):
     """Select multiple batch elements from a KV-cache by index tensor."""
-    if isinstance(past_key_values, Cache):
-        selected_data = [
-            (keys[indices], values[indices])
-            for keys, values in past_key_values
-        ]
-        return DynamicCache(ddp_cache_data=selected_data)
-
-    # Legacy tuple-of-tuples format
-    selected = []
-    for layer_past in past_key_values:
-        selected.append(tuple(t[indices] for t in layer_past))
-    return type(past_key_values)(selected) if not isinstance(past_key_values, list) else selected
+    return _transform_cache(past_key_values, lambda t: t[indices])
