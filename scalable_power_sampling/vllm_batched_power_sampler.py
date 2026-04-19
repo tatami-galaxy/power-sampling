@@ -58,7 +58,7 @@ class VLLMBatchedPowerSampler:
         max_new_tokens: int = 3072,
         use_jackknife: bool = True,
         tensor_parallel_size: int = 1,
-        max_model_len: int = 4096,
+        max_model_len: int = 8192,
         dtype: str = "bfloat16",
         confidence_threshold: float | None = None,
     ):
@@ -78,6 +78,7 @@ class VLLMBatchedPowerSampler:
             max_model_len=max_model_len,
             dtype=dtype,
             trust_remote_code=True,
+            enable_prefix_caching=True,
         )
         self.tokenizer = self.llm.get_tokenizer()
 
