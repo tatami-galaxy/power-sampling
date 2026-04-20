@@ -175,9 +175,14 @@ def load_existing_results(output_path: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
-               args_dict: dict, output_path: str):
+               args_dict: dict, output_path: str, counter, max_responses):
     """Run in a spawned subprocess. Sets CUDA_VISIBLE_DEVICES, creates its own
-    sampler, generates for its shard, writes results to output_path."""
+    sampler, generates for its shard, writes results to output_path.
+
+    `counter` is a shared mp.Value('i') tracking total saved rows across all
+    workers (seeded with rows already on disk). If `max_responses` is set,
+    the worker exits once counter.value reaches it.
+    """
 
     # Must set before any CUDA/torch/vLLM import
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
@@ -211,13 +216,18 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
     print(f"[Worker {rank}] GPUs {gpu_ids}, {len(problems)} problems, {sampler}")
 
     correct_count = 0
-    total_count = 0
+    saved_count = 0
     t0 = time.time()
 
     with open(output_path, "w") as f_out:
         desc = f"worker {rank}"
-        pbar = tqdm(problems, desc=desc, unit="problem", position=rank)
-        for prob in pbar:
+        pbar = tqdm(total=len(problems), desc=desc, unit="response", position=rank)
+        for prob in problems:
+            if max_responses is not None:
+                with counter.get_lock():
+                    if counter.value >= max_responses:
+                        break
+
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prob["problem"]},
@@ -233,7 +243,21 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
 
             response = out["text"]
             pred_answer = extract_boxed_answer(response)
-            correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
+            if not pred_answer:
+                continue
+            correct = is_equiv(pred_answer, prob["answer"])
+
+            # Atomically claim a save slot (or bail if cap reached concurrently)
+            if max_responses is not None:
+                with counter.get_lock():
+                    if counter.value >= max_responses:
+                        break
+                    counter.value += 1
+                    global_saved = counter.value
+            else:
+                with counter.get_lock():
+                    counter.value += 1
+                    global_saved = counter.value
 
             result = {
                 "problem": prob["problem"],
@@ -251,17 +275,24 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
             f_out.write(json.dumps(result) + "\n")
             f_out.flush()
 
-            total_count += 1
+            saved_count += 1
             correct_count += int(correct)
 
-            pbar.set_postfix(
-                correct=f"{correct_count}/{total_count}",
-                tokens=out["num_tokens_generated"],
-                time=f"{sample_elapsed:.1f}s",
-            )
+            pbar.update(1)
+            postfix = {
+                "correct": f"{correct_count}/{saved_count}",
+                "tokens": out["num_tokens_generated"],
+                "time": f"{sample_elapsed:.1f}s",
+            }
+            if max_responses is not None:
+                postfix["global"] = f"{global_saved}/{max_responses}"
+            else:
+                postfix["global"] = str(global_saved)
+            pbar.set_postfix(**postfix)
+        pbar.close()
 
     elapsed = time.time() - t0
-    print(f"[Worker {rank}] Done: {total_count} problems, {correct_count} correct, {elapsed:.1f}s")
+    print(f"[Worker {rank}] Done: {saved_count} saved, {correct_count} correct, {elapsed:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -296,12 +327,16 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
 
     t0 = time.time()
     correct_count = 0
-    total_count = num_already_done
+    saved_count = 0
     total_tokens = 0
+    max_responses = args.max_responses
 
     with open(all_path, "a") as f_all:
-        pbar = tqdm(problems, desc="power sampling", unit="problem")
-        for prob in pbar:
+        pbar = tqdm(total=len(problems), desc="power sampling", unit="response")
+        for prob in problems:
+            if max_responses is not None and num_already_done + saved_count >= max_responses:
+                break
+
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prob["problem"]},
@@ -317,7 +352,9 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
 
             response = out["text"]
             pred_answer = extract_boxed_answer(response)
-            correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
+            if not pred_answer:
+                continue
+            correct = is_equiv(pred_answer, prob["answer"])
 
             result = {
                 "problem": prob["problem"],
@@ -335,22 +372,28 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
             f_all.write(json.dumps(result) + "\n")
             f_all.flush()
 
-            total_count += 1
+            saved_count += 1
             correct_count += int(correct)
             total_tokens += out["num_tokens_generated"]
+            global_saved = num_already_done + saved_count
 
-            pbar.set_postfix(
-                correct=f"{correct_count}/{total_count}",
-                acc=f"{correct_count/total_count*100:.1f}%",
-                tokens=out["num_tokens_generated"],
-                time=f"{sample_elapsed:.1f}s",
-            )
+            pbar.update(1)
+            postfix = {
+                "correct": f"{correct_count}/{saved_count}",
+                "acc": f"{correct_count/saved_count*100:.1f}%",
+                "tokens": out["num_tokens_generated"],
+                "time": f"{sample_elapsed:.1f}s",
+            }
+            if max_responses is not None:
+                postfix["global"] = f"{global_saved}/{max_responses}"
+            pbar.set_postfix(**postfix)
+        pbar.close()
 
     elapsed = time.time() - t0
     print(f"\nGeneration complete in {elapsed:.1f}s")
-    if problems:
-        print(f"  Generated: {len(problems)}, Correct: {correct_count}")
-        print(f"  Avg tokens: {total_tokens / len(problems):.0f}")
+    if saved_count:
+        print(f"  Saved: {saved_count}, Correct: {correct_count}")
+        print(f"  Avg tokens: {total_tokens / saved_count:.0f}")
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +426,12 @@ def generate(args):
 
     if not remaining:
         print("Nothing to generate. Exiting.")
+        _write_correct_subset(all_path, correct_path)
+        _print_summary(all_path)
+        return
+
+    if args.max_responses is not None and len(done) >= args.max_responses:
+        print(f"Already have {len(done)} >= max_responses ({args.max_responses}). Exiting.")
         _write_correct_subset(all_path, correct_path)
         _print_summary(all_path)
         return
@@ -427,11 +476,17 @@ def generate(args):
 
         # Spawn workers
         mp.set_start_method("spawn", force=True)
+
+        # Shared counter seeded with rows already on disk; workers stop when
+        # counter.value >= args.max_responses.
+        saved_counter = mp.Value("i", len(done))
+
         processes = []
         for i in range(num_workers):
             p = mp.Process(
                 target=_worker_fn,
-                args=(i, gpu_assignments[i], shards[i], args_dict, worker_paths[i]),
+                args=(i, gpu_assignments[i], shards[i], args_dict, worker_paths[i],
+                      saved_counter, args.max_responses),
             )
             processes.append(p)
             p.start()
@@ -549,13 +604,16 @@ def main():
     parser.add_argument("--alpha", type=float, default=4.0)
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--num_rollouts", type=int, default=8)
-    parser.add_argument("--lookahead", type=int, default=32)
+    parser.add_argument("--lookahead", type=int, default=192)
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Tokens per chunk (B)")
     parser.add_argument("--num_candidates", type=int, default=32,
                         help="Candidate chunks per step (L)")
     parser.add_argument("--max_tokens", type=int, default=4096,
                         help="Max tokens per generation")
+    parser.add_argument("--max_responses", type=int, default=None,
+                        help="Stop after this many saved rows globally (across all workers, "
+                             "counting any rows already on disk from a prior run).")
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 gap exceeds this")
 
