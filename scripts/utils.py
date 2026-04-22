@@ -120,7 +120,7 @@ def register_dataset_eval(name):
 
 def register_dataset_train(name):
     def wrapper(fn):
-        DATASET_REGISTRY_EVAL[name] = fn
+        DATASET_REGISTRY_TRAIN[name] = fn
         return fn
     return wrapper
 
@@ -153,6 +153,22 @@ def load_aime_2025(levels: list[int] | None = None) -> list[dict]:
             "level": 0,
             "subject": ", ".join(row["problem_type"]),
             "unique_id": f"aime2025_{row['problem_idx']}",
+        })
+    return out
+
+
+@register_dataset_eval("hmmt_feb_2025")
+def load_hmmt_feb_2025(levels: list[int] | None = None) -> list[dict]:
+    ds = load_dataset("MathArena/hmmt_feb_2025", split="train")
+    out = []
+    for row in ds:
+        out.append({
+            "problem": row["problem"],
+            "answer": str(row["answer"]),
+            "solution": "",
+            "level": 0,
+            "subject": ", ".join(row["problem_type"]),
+            "unique_id": f"hmmt_feb2025_{row['problem_idx']}",
         })
     return out
 
@@ -267,7 +283,7 @@ def load_deepmath(
     return ds_exploded
 
 
-@register_dataset_eval("openthoughts")
+@register_dataset_train("openthoughts")
 def load_openthoughts(
     max_samples: int | None = None,
     seed: int = 42,
