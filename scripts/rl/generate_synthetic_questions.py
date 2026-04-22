@@ -28,26 +28,14 @@ from vllm import LLM, SamplingParams
 
 
 TOPICS = [
-    "algebra: polynomials",
-    "algebra: inequalities",
-    "algebra: systems of equations",
-    "algebra: functional equations",
-    "number theory: modular arithmetic",
-    "number theory: divisibility and primes",
-    "number theory: Diophantine equations",
-    "combinatorics: counting",
-    "combinatorics: probability",
-    "combinatorics: pigeonhole and invariants",
-    "combinatorics: recursion and generating functions",
-    "geometry: Euclidean plane geometry",
-    "geometry: coordinate geometry",
-    "geometry: trigonometry",
-    "geometry: 3D solid geometry",
-    "calculus: limits and continuity",
-    "calculus: derivatives and optimization",
-    "calculus: definite and indefinite integrals",
-    "calculus: infinite series and sequences",
-    "linear algebra: matrices, determinants, eigenvalues",
+    "advanced algebra",
+    "number theory",
+    "combinatorics",
+    "probability theory",
+    "geometry",
+    "advanced calculus",
+    "differential equations",
+    "advanced linear algebra",
 ]
 
 
