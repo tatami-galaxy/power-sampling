@@ -85,6 +85,11 @@ def _parse_verdict(text: str) -> bool:
     return first_line.lower().startswith("yes")
 
 
+def _normalize(s: str) -> str:
+    """Lowercase and collapse whitespace for duplicate detection."""
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Base")
@@ -128,28 +133,44 @@ def main():
         seed=args.seed,
     )
 
-    # ── 1. Generate candidate problems ───────────────────────────────────────
-    gen_prompts = [_chat(GENERATION_PROMPT.format(topic=t)) for t in TOPICS]
+    # ── 1. Generate candidate problems (per-sample seeds, one request each) ──
     total = len(TOPICS) * args.per_topic
-    print(f"Generating {total} problems over {len(TOPICS)} topics ({args.per_topic} each)...")
+    gen_prompts: list[str] = []
+    gen_topics_flat: list[str] = []
+    gen_params_list: list[SamplingParams] = []
+    for topic_idx, topic in enumerate(TOPICS):
+        for k in range(args.per_topic):
+            gen_prompts.append(_chat(GENERATION_PROMPT.format(topic=topic)))
+            gen_topics_flat.append(topic)
+            gen_params_list.append(SamplingParams(
+                n=1,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.max_tokens_generate,
+                seed=args.seed + topic_idx * args.per_topic + k,
+            ))
+    print(f"Generating {total} problems over {len(TOPICS)} topics ({args.per_topic} each, per-sample seeds)...")
 
-    gen_params = SamplingParams(
-        n=args.per_topic,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens_generate,
-        seed=args.seed,
-    )
-    gen_outputs = llm.generate(gen_prompts, gen_params)
+    gen_outputs = llm.generate(gen_prompts, gen_params_list)
 
     problems: list[dict] = []
-    for topic, req_out in zip(TOPICS, gen_outputs):
-        for completion in req_out.outputs:
-            problem = _strip_thinking(completion.text)
-            if problem:
-                problems.append({"topic": topic, "problem": problem})
+    seen: set[str] = set()
+    duplicates = 0
+    empty = 0
+    for topic, req_out in zip(gen_topics_flat, gen_outputs):
+        text = _strip_thinking(req_out.outputs[0].text)
+        if not text:
+            empty += 1
+            continue
+        key = _normalize(text)
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        problems.append({"topic": topic, "problem": text})
 
-    print(f"Got {len(problems)} non-empty candidates")
+    print(f"Got {len(problems)} unique candidates "
+          f"({duplicates} duplicates, {empty} empty dropped)")
 
     # ── 2. Self-critique ──────────────────────────────────────────────────────
     crit_prompts = [_chat(CRITIQUE_PROMPT.format(problem=p["problem"])) for p in problems]

@@ -97,10 +97,31 @@ def _get_visible_gpus() -> list[int]:
 # ---------------------------------------------------------------------------
 
 def load_problems(dataset: str, max_problems: int | None, sources: list[str] | None,
-                  difficulty: list[str] | None, seed: int) -> list[dict]:
-    """Load problems from the specified dataset as a list of dicts."""
+                  difficulty: list[str] | None, seed: int,
+                  synthetic_file: str | None = None) -> list[dict]:
+    """Load problems from the specified dataset as a list of dicts.
 
-    if dataset == "deepmath":
+    For ``dataset == "synthetic"``, reads a JSONL file with ``problem`` (and
+    optionally ``topic``) fields. No gold answer is expected; ``answer`` is
+    set to ``None`` and downstream correctness checks are skipped.
+    """
+
+    if dataset == "synthetic":
+        if not synthetic_file:
+            raise ValueError("--synthetic_file is required when --dataset synthetic")
+        problems = []
+        with open(synthetic_file) as f:
+            for line in f:
+                row = json.loads(line)
+                if not row.get("problem"):
+                    continue
+                problems.append({
+                    "problem": row["problem"],
+                    "answer": None,
+                    "difficulty": row.get("topic"),
+                })
+
+    elif dataset == "deepmath":
         ds = load_dataset("zwhe99/DeepMath-103K", split="train")
         problems = []
         for row in ds:
@@ -245,7 +266,10 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
             pred_answer = extract_boxed_answer(response)
             if not pred_answer:
                 continue
-            correct = is_equiv(pred_answer, prob["answer"])
+            if prob.get("answer") is None:
+                correct = None  # no gold — skip verification
+            else:
+                correct = is_equiv(pred_answer, prob["answer"])
 
             # Atomically claim a save slot (or bail if cap reached concurrently)
             if max_responses is not None:
@@ -276,11 +300,11 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
             f_out.flush()
 
             saved_count += 1
-            correct_count += int(correct)
+            correct_count += int(correct is True)
 
             pbar.update(1)
             postfix = {
-                "correct": f"{correct_count}/{saved_count}",
+                "correct": ("n/a" if correct is None else f"{correct_count}/{saved_count}"),
                 "tokens": out["num_tokens_generated"],
                 "time": f"{sample_elapsed:.1f}s",
             }
@@ -354,7 +378,10 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
             pred_answer = extract_boxed_answer(response)
             if not pred_answer:
                 continue
-            correct = is_equiv(pred_answer, prob["answer"])
+            if prob.get("answer") is None:
+                correct = None  # no gold — skip verification
+            else:
+                correct = is_equiv(pred_answer, prob["answer"])
 
             result = {
                 "problem": prob["problem"],
@@ -373,17 +400,24 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
             f_all.flush()
 
             saved_count += 1
-            correct_count += int(correct)
+            correct_count += int(correct is True)
             total_tokens += out["num_tokens_generated"]
             global_saved = num_already_done + saved_count
 
             pbar.update(1)
-            postfix = {
-                "correct": f"{correct_count}/{saved_count}",
-                "acc": f"{correct_count/saved_count*100:.1f}%",
-                "tokens": out["num_tokens_generated"],
-                "time": f"{sample_elapsed:.1f}s",
-            }
+            if correct is None:
+                postfix = {
+                    "correct": "n/a",
+                    "tokens": out["num_tokens_generated"],
+                    "time": f"{sample_elapsed:.1f}s",
+                }
+            else:
+                postfix = {
+                    "correct": f"{correct_count}/{saved_count}",
+                    "acc": f"{correct_count/saved_count*100:.1f}%",
+                    "tokens": out["num_tokens_generated"],
+                    "time": f"{sample_elapsed:.1f}s",
+                }
             if max_responses is not None:
                 postfix["global"] = f"{global_saved}/{max_responses}"
             pbar.set_postfix(**postfix)
@@ -408,12 +442,19 @@ def generate(args):
         sources=args.sources,
         difficulty=args.difficulty,
         seed=args.seed,
+        synthetic_file=args.synthetic_file,
     )
-    print(f"Loaded {len(problems)} problems from {args.dataset}")
+    src = args.synthetic_file if args.dataset == "synthetic" else args.dataset
+    print(f"Loaded {len(problems)} problems from {src}")
 
     # --- Output paths ---
     model_slug = args.model.replace("/", "_")
-    output_dir = os.path.join(args.output_dir, args.dataset, model_slug, f"alpha_{args.alpha}")
+    if args.dataset == "synthetic":
+        stem = os.path.splitext(os.path.basename(args.synthetic_file))[0]
+        dataset_slug = f"synthetic_{stem}"
+    else:
+        dataset_slug = args.dataset
+    output_dir = os.path.join(args.output_dir, dataset_slug, model_slug, f"alpha_{args.alpha}")
     os.makedirs(output_dir, exist_ok=True)
 
     all_path = os.path.join(output_dir, "power_demos_all.jsonl")
@@ -527,14 +568,20 @@ def _write_correct_subset(all_path: str, correct_path: str):
     """Read all results and write correct-only subset."""
     total = 0
     correct = 0
+    has_verifier = False
     with open(all_path) as f_in, open(correct_path, "w") as f_out:
         for line in f_in:
             total += 1
             row = json.loads(line)
-            if row.get("correct"):
+            if row.get("correct") is not None:
+                has_verifier = True
+            if row.get("correct") is True:
                 f_out.write(line)
                 correct += 1
-    print(f"Wrote {correct}/{total} correct demos to {correct_path}")
+    if has_verifier:
+        print(f"Wrote {correct}/{total} correct demos to {correct_path}")
+    else:
+        print(f"No gold answers — correct-only subset skipped (train on {all_path})")
 
 
 def _print_summary(all_path: str):
@@ -548,12 +595,16 @@ def _print_summary(all_path: str):
         return
 
     total = len(results)
-    correct = sum(r["correct"] for r in results)
+    has_verifier = any(r.get("correct") is not None for r in results)
+    correct = sum(1 for r in results if r.get("correct") is True)
     tokens = [r["num_tokens_generated"] for r in results]
     times = [r.get("sample_time_s", 0) for r in results]
 
     print(f"\n{'='*60}")
-    print(f"Summary: {total} demos, {correct} correct ({correct/total*100:.1f}%)")
+    if has_verifier:
+        print(f"Summary: {total} demos, {correct} correct ({correct/total*100:.1f}%)")
+    else:
+        print(f"Summary: {total} demos (no gold answers — correctness not evaluated)")
     print(f"  Tokens: mean={sum(tokens)/total:.0f}, min={min(tokens)}, max={max(tokens)}")
     print(f"  Time:   mean={sum(times)/total:.1f}s")
 
@@ -565,13 +616,16 @@ def _print_summary(all_path: str):
             if d not in difficulties:
                 difficulties[d] = {"correct": 0, "total": 0}
             difficulties[d]["total"] += 1
-            difficulties[d]["correct"] += int(r["correct"])
+            difficulties[d]["correct"] += int(r.get("correct") is True)
 
     if difficulties:
         print(f"\n  By difficulty:")
         for d in sorted(difficulties.keys()):
             s = difficulties[d]
-            print(f"    {d}: {s['correct']}/{s['total']} ({s['correct']/s['total']*100:.1f}%)")
+            if has_verifier:
+                print(f"    {d}: {s['correct']}/{s['total']} ({s['correct']/s['total']*100:.1f}%)")
+            else:
+                print(f"    {d}: {s['total']}")
     print(f"{'='*60}")
 
 
@@ -591,7 +645,11 @@ def main():
 
     # Data
     parser.add_argument("--dataset", type=str, default="deepmath",
-                        choices=["deepmath", "polaris", "numinamath"])
+                        choices=["deepmath", "polaris", "numinamath", "synthetic"])
+    parser.add_argument("--synthetic_file", type=str, default=None,
+                        help="JSONL of synthetic questions (problem, optionally topic). "
+                             "Required when --dataset synthetic. No gold answers expected; "
+                             "correctness is not evaluated.")
     parser.add_argument("--max_problems", type=int, default=None,
                         help="Max problems to load from dataset before generation")
     parser.add_argument("--sources", nargs="*", default=None,
