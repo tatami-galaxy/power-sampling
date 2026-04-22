@@ -164,34 +164,42 @@ def _build_padded_batch(
     prompt_ids: list[torch.Tensor],
     completion_ids: list[torch.Tensor],
     pad_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Right-pad [prompt ‖ completion] sequences and build a completion mask.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Left-pad [prompt ‖ completion] so all completions right-align.
 
-    comp_mask[i, t] = True  iff  logits[i, t, :]  predicts a completion token
-                             for item i  (positions [L_p−1, L_p−1+L_c)).
+    Layout per row i: ``[PAD × (max_len − Lp_i − Lc_i), prompt_i, completion_i]``.
+    With completions flush to the right edge, ``logits_to_keep = max_Lc + 1``
+    passed to the forward skips projecting non-completion hidden states
+    through the (huge) lm_head.
+
+    comp_mask aligns with ``model(...).logits[:, -(max_Lc+1):-1, :]``:
+    comp_mask[i, t] = True iff that logit predicts a completion token for item i.
 
     Returns:
-        input_ids  : [B, max_len]
-        attn_mask  : [B, max_len]
-        comp_mask  : [B, max_len − 1]  bool
+        input_ids : [B, max_len]
+        attn_mask : [B, max_len]
+        comp_mask : [B, max_Lc]  bool, right-aligned
+        max_Lc    : int
     """
     B = len(prompt_ids)
-    lens = [p.shape[0] + c.shape[0] for p, c in zip(prompt_ids, completion_ids)]
+    Lps = [p.shape[0] for p in prompt_ids]
+    Lcs = [c.shape[0] for c in completion_ids]
+    lens = [lp + lc for lp, lc in zip(Lps, Lcs)]
     max_len = max(lens)
+    max_Lc = max(Lcs) if Lcs else 0
 
     ids  = torch.full((B, max_len), pad_token_id, dtype=torch.long)
     mask = torch.zeros(B, max_len, dtype=torch.long)
-    comp = torch.zeros(B, max_len - 1, dtype=torch.bool)
+    comp = torch.zeros(B, max_Lc, dtype=torch.bool)
 
     for i, (p, c) in enumerate(zip(prompt_ids, completion_ids)):
-        Lp, Lc = p.shape[0], c.shape[0]
-        ids[i, : Lp + Lc] = torch.cat([p, c])
-        mask[i, : Lp + Lc] = 1
-        # logits[:, t, :] predicts token at input position t+1.
-        # First completion token is at input position Lp → logit position Lp−1.
-        comp[i, Lp - 1 : Lp - 1 + Lc] = True
+        L = Lps[i] + Lcs[i]
+        ids[i, max_len - L:] = torch.cat([p, c])
+        mask[i, max_len - L:] = 1
+        if Lcs[i] > 0:
+            comp[i, max_Lc - Lcs[i]:] = True
 
-    return ids, mask, comp
+    return ids, mask, comp, max_Lc
 
 
 def _apply_skip_mask(
@@ -330,6 +338,7 @@ class SDFTTrainer(Trainer):
         max_new_tokens: int = 512,
         skip_first_n_tokens: int = 3,
         kl_direction: str = "forward",
+        kl_topk: int | None = None,
         # vLLM options
         use_vllm: bool = False,
         vllm_port: int = 8000,
@@ -343,6 +352,7 @@ class SDFTTrainer(Trainer):
         self.max_new_tokens = max_new_tokens
         self.skip_first_n_tokens = skip_first_n_tokens
         self.kl_direction = kl_direction
+        self.kl_topk = kl_topk
         self.use_vllm = use_vllm
         self.importance_sampling_correction = importance_sampling_correction
         self.importance_sampling_cap = importance_sampling_cap
@@ -476,34 +486,43 @@ class SDFTTrainer(Trainer):
                 student_prompts.append(s_ids[i][s_mask[i].bool()].cpu())
                 teacher_prompts.append(t_ids[i][t_mask[i].bool()].cpu())
 
-        # ── 2. Build padded full sequences (prompt ‖ completion) ─────────────
-        sf_ids, sf_mask, comp_s = _build_padded_batch(student_prompts, completions, pad_id)
-        tf_ids, tf_mask, comp_t = _build_padded_batch(teacher_prompts, completions, pad_id)
+        # ── 2. Build left-padded full sequences (prompt ‖ completion) ────────
+        sf_ids, sf_mask, comp_s, max_Lc = _build_padded_batch(student_prompts, completions, pad_id)
+        tf_ids, tf_mask, comp_t, _      = _build_padded_batch(teacher_prompts, completions, pad_id)
 
         sf_ids  = sf_ids.to(device);  sf_mask = sf_mask.to(device)
         tf_ids  = tf_ids.to(device);  tf_mask = tf_mask.to(device)
         comp_s  = comp_s.to(device);  comp_t  = comp_t.to(device)
+        logits_to_keep = max_Lc + 1
 
         # ── 3. Teacher forward (no grad) ──────────────────────────────────────
         with torch.no_grad():
             t_logits = self.teacher_model(
                 input_ids=tf_ids, attention_mask=tf_mask, use_cache=False,
-            ).logits  # [B, L_t, V]
-            teacher_log_p = torch.log_softmax(
-                t_logits[:, :-1, :][comp_t].float(), dim=-1
-            )  # [N, V]
-            del t_logits
+                logits_to_keep=logits_to_keep,
+            ).logits[:, :-1, :]  # [B, max_Lc, V]
 
         # ── 4. Student forward (with grad) ────────────────────────────────────
         s_logits = model(
             input_ids=sf_ids, attention_mask=sf_mask, use_cache=False,
-        ).logits  # [B, L_s, V]
-        student_log_p = torch.log_softmax(
-            s_logits[:, :-1, :][comp_s].float(), dim=-1
-        )  # [N, V]
-        del s_logits
+            logits_to_keep=logits_to_keep,
+        ).logits[:, :-1, :]  # [B, max_Lc, V]
 
-        # ── 5. KL divergence over full vocabulary per completion token ────────
+        # ── 5. KL divergence per completion token ─────────────────────────────
+        if self.kl_topk is not None:
+            # Top-k KL: take student's top-k logits, gather teacher at same
+            # indices, renormalize on the subset. Matches TRL's default.
+            k = self.kl_topk
+            s_topk_vals, topk_idx = s_logits.topk(k, dim=-1)         # [B, max_Lc, k]
+            t_topk_vals = t_logits.gather(-1, topk_idx)              # [B, max_Lc, k]
+            s_topk_log_p = s_topk_vals.float() - s_topk_vals.float().logsumexp(-1, keepdim=True)
+            t_topk_log_p = t_topk_vals.float() - t_topk_vals.float().logsumexp(-1, keepdim=True)
+            student_log_p = s_topk_log_p[comp_s]                     # [N, k]
+            teacher_log_p = t_topk_log_p[comp_t]                     # [N, k]
+        else:
+            student_log_p = torch.log_softmax(s_logits[comp_s].float(), dim=-1)  # [N, V]
+            teacher_log_p = torch.log_softmax(t_logits[comp_t].float(), dim=-1)  # [N, V]
+
         if self.kl_direction == "reverse":
             per_token_kl = (student_log_p.exp() * (student_log_p - teacher_log_p)).sum(-1)  # [N]
         else:
@@ -516,13 +535,14 @@ class SDFTTrainer(Trainer):
         #  Tokens were sampled from π_vllm (possibly stale weights).
         #  IS weight = π_θ(y_t) / π_vllm(y_t),  applied per-sequence.
         if self.use_vllm and self.importance_sampling_correction and vllm_token_logprobs is not None:
-            # Gather student log-prob at the actually-sampled token ids.
-            # comp_token_ids: 1-D tensor of sampled completion token ids in
-            # the same flattened order as student_log_p rows.
-            comp_token_ids = torch.cat(completions).to(device)  # [N]
-            student_selected_lp = student_log_p[
-                torch.arange(student_log_p.shape[0], device=device), comp_token_ids
-            ]  # [N]
+            # Compute per-token student log-prob at the sampled token ids
+            # directly from raw logits (independent of top-k path).
+            comp_token_ids = torch.cat(completions).to(device)       # [N]
+            s_logits_flat = s_logits[comp_s]                         # [N, V]
+            s_sel = s_logits_flat.gather(-1, comp_token_ids.unsqueeze(-1)).squeeze(-1).float()
+            s_lse = s_logits_flat.float().logsumexp(-1)
+            student_selected_lp = s_sel - s_lse                      # [N]
+            del s_logits_flat
 
             # Flatten vLLM log-probs to match.
             vllm_lp = torch.tensor(
@@ -646,6 +666,7 @@ def train(args):
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         bf16=True,
+        optim=args.optim,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         logging_steps=args.logging_steps,
         save_strategy="steps",
@@ -685,6 +706,7 @@ def train(args):
         max_new_tokens=args.max_new_tokens,
         skip_first_n_tokens=args.skip_first_n_tokens,
         kl_direction=args.kl_direction,
+        kl_topk=args.kl_topk,
         # vLLM
         use_vllm=args.use_vllm,
         vllm_port=args.vllm_port,
@@ -711,6 +733,7 @@ def train(args):
     print(f"  EMA alpha:           {args.ema_alpha}")
     print(f"  Skip first tokens:   {args.skip_first_n_tokens}")
     print(f"  KL direction:        {args.kl_direction}")
+    print(f"  KL top-k:            {args.kl_topk}")
     print(f"  Learning rate:       {args.learning_rate}")
     if args.use_vllm:
         print(f"  vLLM port:           {args.vllm_port}")
@@ -766,6 +789,10 @@ def main():
     parser.add_argument("--kl_direction", type=str, default="forward",
                         choices=["reverse", "forward"],
                         help="KL direction: 'forward' matches reference codebase default, 'reverse' matches paper equations")
+    parser.add_argument("--kl_topk", type=int, default=None,
+                        help="If set, compute KL over student's top-k logits (teacher gathered at same indices, "
+                             "subset renormalized). Typical value 100. Matches TRL v1.2 default; trades a small "
+                             "approximation for large memory savings on the KL tensor.")
 
     # vLLM (optional, for faster on-policy generation)
     parser.add_argument("--use_vllm", action="store_true",
@@ -793,6 +820,13 @@ def main():
     parser.add_argument("--ddp_find_unused_parameters", action="store_true",
                         help="Enable DDP find_unused_parameters (default: off)")
     parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--optim", type=str, default="adamw_torch",
+                        choices=["adamw_torch", "adamw_torch_fused",
+                                 "adamw_bnb_8bit", "paged_adamw_8bit",
+                                 "paged_adamw_32bit"],
+                        help="Optimizer. Use 'paged_adamw_8bit' (bitsandbytes) "
+                             "to ~halve optimizer-state memory and fit larger "
+                             "models under DDP.")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
                         choices=["linear", "cosine", "cosine_with_restarts",
                                  "polynomial", "constant", "constant_with_warmup",
