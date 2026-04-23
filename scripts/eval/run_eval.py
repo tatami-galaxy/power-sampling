@@ -396,6 +396,32 @@ def print_report(eval_output: dict):
         print(f"\nExtraction failures (no \\boxed{{}}): {no_answer}/{total}")
 
 
+def print_comparison(baseline_output: dict, power_output: dict):
+    """Confusion matrix of correctness between baseline and power sampling.
+
+    Matches problems by the `problem` string so the two evals don't need to
+    be in the same order.
+    """
+    base = {r["problem"]: r["correct"] for r in baseline_output["results"]}
+    power = {r["problem"]: r["correct"] for r in power_output["results"]}
+    shared = set(base) & set(power)
+
+    both_right = sum(1 for p in shared if base[p] and power[p])
+    both_wrong = sum(1 for p in shared if not base[p] and not power[p])
+    base_wrong_power_right = sum(1 for p in shared if not base[p] and power[p])
+    base_right_power_wrong = sum(1 for p in shared if base[p] and not power[p])
+
+    print(f"\n{'='*60}")
+    print(f"Baseline vs {power_output.get('method', 'power')} ({len(shared)} shared problems)")
+    print(f"{'='*60}")
+    print(f"  Both correct:                 {both_right}")
+    print(f"  Both wrong:                   {both_wrong}")
+    print(f"  Baseline wrong -> Power right: {base_wrong_power_right}")
+    print(f"  Baseline right -> Power wrong: {base_right_power_wrong}")
+    print(f"  Net delta:                    {base_wrong_power_right - base_right_power_wrong:+d}")
+    print(f"{'='*60}")
+
+
 def save_results(eval_output: dict, output_dir: str):
     """Save full results and summary to disk."""
     os.makedirs(output_dir, exist_ok=True)
@@ -611,6 +637,7 @@ def main():
             print_report(ps_output)
             ps_dir = output_dir + "/" + ps_output["method"]
             save_results(ps_output, ps_dir)
+            print_comparison(eval_output, ps_output)
 
 
 if __name__ == "__main__":
