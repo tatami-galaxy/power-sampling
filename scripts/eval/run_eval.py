@@ -2,36 +2,11 @@
 Evaluate language models on MATH and other math benchmarks.
 
 Usage:
-    python -m src.eval.run_eval \
-        --model meta-llama/Llama-3.1-8B-Instruct \
-        --dataset math500 \
-        --output_dir results/eval
-
-    # Multiple models
-    python -m src.eval.run_eval \
-        --model meta-llama/Llama-3.1-8B-Instruct Qwen/Qwen2.5-7B-Instruct \
-        --dataset math500 \
-        --output_dir results/eval
-
-    # Filter by difficulty level
-    python -m src.eval.run_eval \
-        --model meta-llama/Llama-3.1-8B-Instruct \
-        --dataset math500 \
-        --levels 1 2 3 \
-        --output_dir results/eval
-
-    # Power sampling
-    uv run python -m scripts.run_eval \
-        --model Qwen/Qwen2.5-0.5B \
-        --dataset math500 \
-        --num_samples 20 \
-        --power_sampling \
-        --alpha 4.0 --top_k 8 --num_rollouts 8 --lookahead 32
 
     CUDA_VISIBLE_DEVICES=6 uv run python -m scripts.run_eval \
         --model allenai/Olmo-3-1025-7B \
         --chat_template_model allenai/Olmo-3-7B-Instruct \
-        --dataset math500 --num_samples 10 --power_sampling --use_vllm
+        --dataset math500 --num_samples 10 --power_sampling 
 """
 
 import argparse
@@ -45,6 +20,7 @@ from scripts.utils import (
     is_equiv,
     DATASET_REGISTRY_EVAL,
 )
+from scalable_power_sampling import VLLMBatchedPowerSampler
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +124,8 @@ def evaluate_model_power_sampling(
     top_k: int = 8,
     num_rollouts: int = 8,
     lookahead: int = 32,
-    batched: bool = False,
     batch_size: int = 8,
     num_candidates: int = 32,
-    use_vllm: bool = False,
-    use_smc: bool = False,
-    n_particles: int = 64,
-    ess_threshold: float = 0.5,
-    smc_block_size: int = 64,
-    alpha_ramp_tokens: int = 100,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     confidence_threshold: float | None = None,
@@ -167,97 +136,31 @@ def evaluate_model_power_sampling(
     import torch
     from tqdm import tqdm
 
-    if use_smc:
-        method = "smc_power_sampling"
-    elif use_vllm:
-        method = "vllm_batched_power_sampling"
-    elif batched:
-        method = "batched_power_sampling"
-    else:
-        method = "power_sampling"
+    method = "power_sampling"
 
     print(f"\n{'='*60}")
     print(f"Evaluating ({method}): {model_name}")
-    if use_smc:
-        print(f"  alpha={alpha}, N={n_particles}, ESS_thresh={ess_threshold}")
-        print(f"  block_size={smc_block_size}, alpha_ramp_tokens={alpha_ramp_tokens}")
-    else:
-        print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
-        if batched or use_vllm:
-            print(f"  B={batch_size}, L={num_candidates}")
-        if confidence_threshold is not None:
-            print(f"  confidence_threshold={confidence_threshold}")
+    print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
+    print(f"  B={batch_size}, L={num_candidates}")
+    if confidence_threshold is not None:
+        print(f"  confidence_threshold={confidence_threshold}")
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
 
-    if use_vllm:
-        from scalable_power_sampling import VLLMBatchedPowerSampler
-
-        sampler = VLLMBatchedPowerSampler(
-            model_name=model_name,
-            alpha=alpha,
-            batch_size=batch_size,
-            num_candidates=num_candidates,
-            top_k=top_k,
-            num_rollouts=num_rollouts,
-            lookahead=lookahead,
-            max_new_tokens=max_tokens,
-            tensor_parallel_size=tensor_parallel_size,
-            max_model_len=max_model_len,
-            confidence_threshold=confidence_threshold,
-        )
-        tokenizer = sampler.tokenizer
-    else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-            device_map=device,
-            trust_remote_code=True,
-        )
-
-        if use_smc:
-            from scalable_power_sampling import SMCPowerSampler
-
-            sampler = SMCPowerSampler(
-                model=model,
-                tokenizer=tokenizer,
-                alpha=alpha,
-                n_particles=n_particles,
-                ess_threshold=ess_threshold,
-                block_size=smc_block_size,
-                alpha_ramp_tokens=alpha_ramp_tokens,
-                max_new_tokens=max_tokens,
-            )
-        elif batched:
-            from scalable_power_sampling import BatchedPowerSampler
-
-            sampler = BatchedPowerSampler(
-                model=model,
-                tokenizer=tokenizer,
-                alpha=alpha,
-                batch_size=batch_size,
-                num_candidates=num_candidates,
-                top_k=top_k,
-                num_rollouts=num_rollouts,
-                lookahead=lookahead,
-                max_new_tokens=max_tokens,
-            )
-        else:
-            from scalable_power_sampling import PowerSampler
-
-            sampler = PowerSampler(
-                model=model,
-                tokenizer=tokenizer,
-                alpha=alpha,
-                top_k=top_k,
-                num_rollouts=num_rollouts,
-                lookahead=lookahead,
-                max_new_tokens=max_tokens,
-            )
+    sampler = VLLMBatchedPowerSampler(
+        model_name=model_name,
+        alpha=alpha,
+        batch_size=batch_size,
+        num_candidates=num_candidates,
+        top_k=top_k,
+        num_rollouts=num_rollouts,
+        lookahead=lookahead,
+        max_new_tokens=max_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        confidence_threshold=confidence_threshold,
+    )
+    tokenizer = sampler.tokenizer
 
     results = []
     t0 = time.time()
@@ -272,11 +175,7 @@ def evaluate_model_power_sampling(
         messages = format_prompt(prob["problem"])
         prompt_text = template_tok.apply_chat_template(messages, **template_kwargs)
 
-        if use_vllm:
-            input_ids = tokenizer.encode(prompt_text)
-        else:
-            device = next(sampler.model.parameters()).device
-            input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
+        input_ids = tokenizer.encode(prompt_text)
 
         sample_t0 = time.time()
         out = sampler.generate(input_ids=input_ids, verbose=False)
@@ -305,22 +204,14 @@ def evaluate_model_power_sampling(
     elapsed = time.time() - t0
     print(f"{method} took {elapsed:.1f}s total")
 
-    if use_smc:
-        config = {
-            "alpha": alpha, "n_particles": n_particles,
-            "ess_threshold": ess_threshold, "block_size": smc_block_size,
-            "alpha_ramp_tokens": alpha_ramp_tokens,
-        }
-    else:
-        config = {
-            "alpha": alpha, "top_k": top_k,
-            "num_rollouts": num_rollouts, "lookahead": lookahead,
-        }
-        if batched or use_vllm:
-            config["batch_size"] = batch_size
-            config["num_candidates"] = num_candidates
-        if confidence_threshold is not None:
-            config["confidence_threshold"] = confidence_threshold
+    config = {
+        "alpha": alpha, "top_k": top_k,
+        "num_rollouts": num_rollouts, "lookahead": lookahead,
+    }
+    config["batch_size"] = batch_size
+    config["num_candidates"] = num_candidates
+    if confidence_threshold is not None:
+        config["confidence_threshold"] = confidence_threshold
 
     return {
         "model": model_name,
@@ -521,6 +412,14 @@ def main():
                         help="Evaluate on a random subset of N samples (useful for quick tests)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for subset selection")
+    parser.add_argument("--chat_template_model", type=str, default=None,
+                        help="Load chat template from this model (e.g. the instruct variant) "
+                             "for base models that lack one")
+    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="For models with a toggleable thinking mode (e.g. Qwen3): "
+                            "pass --enable-thinking or --no-enable-thinking to override "
+                            "the template default. Leave unset to use the model default.")
 
     # Power sampling options
     parser.add_argument("--power_sampling", action="store_true",
@@ -533,37 +432,13 @@ def main():
                         help="Rollouts per candidate for power sampling")
     parser.add_argument("--lookahead", type=int, default=192,
                         help="Rollout horizon in tokens for power sampling")
-    parser.add_argument("--batched", action="store_true",
-                        help="Use batched power sampling (Algorithm 2) instead of single-token")
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Tokens per chunk for batched power sampling (B)")
     parser.add_argument("--num_candidates", type=int, default=32,
                         help="Candidate chunks to generate per step for batched power sampling (L)")
-    parser.add_argument("--use_vllm", action="store_true",
-                        help="Use vLLM backend for power sampling (much faster, implies --batched)")
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
-
-    # SMC power sampling options
-    parser.add_argument("--use_smc", action="store_true",
-                        help="Use Power-SMC (particle-based) instead of rollout-based power sampling")
-    parser.add_argument("--n_particles", type=int, default=64,
-                        help="Number of SMC particles (N)")
-    parser.add_argument("--ess_threshold", type=float, default=0.5,
-                        help="Resample when ESS < threshold * N")
-    parser.add_argument("--smc_block_size", type=int, default=64,
-                        help="Check ESS every this many tokens")
-    parser.add_argument("--alpha_ramp_tokens", type=int, default=100,
-                        help="Linear alpha ramp from 1 to target over this many tokens (0 to disable)")
-
-    parser.add_argument("--chat_template_model", type=str, default=None,
-                        help="Load chat template from this model (e.g. the instruct variant) "
-                             "for base models that lack one")
-    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
-                        default=None,
-                        help="For models with a toggleable thinking mode (e.g. Qwen3): "
-                             "pass --enable-thinking or --no-enable-thinking to override "
-                             "the template default. Leave unset to use the model default.")
+    
 
     args = parser.parse_args()
 
@@ -619,15 +494,8 @@ def main():
                 top_k=args.top_k,
                 num_rollouts=args.num_rollouts,
                 lookahead=args.lookahead,
-                batched=args.batched,
                 batch_size=args.batch_size,
                 num_candidates=args.num_candidates,
-                use_vllm=args.use_vllm,
-                use_smc=args.use_smc,
-                n_particles=args.n_particles,
-                ess_threshold=args.ess_threshold,
-                smc_block_size=args.smc_block_size,
-                alpha_ramp_tokens=args.alpha_ramp_tokens,
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len or None,
                 confidence_threshold=args.confidence_threshold,
