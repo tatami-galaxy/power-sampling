@@ -1,52 +1,24 @@
 """
-Generate power-sampled demonstrations for SDFT distillation.
+Generate baseline demonstrations (plain vLLM sampling — no power distribution)
+for comparison against power-sampled demos from generate_power_demos.py.
 
-Uses VLLMBatchedPowerSampler to generate high-quality solutions from the
-model's own sharpened distribution pi_alpha, then verifies correctness
-against gold answers.  Saves results as JSONL compatible with train_sdft.py.
+Identical data-loading, resume, multi-GPU, and output-file structure — just
+swaps the sampler for standard autoregressive sampling at configurable
+temperature / top_p.
 
 Output files:
-  {output_dir}/power_demos_all.jsonl       — all generations
-  {output_dir}/power_demos_correct.jsonl   — filtered to verified correct
+  {output_dir}/demos_all.jsonl       — all generations
+  {output_dir}/demos_correct.jsonl   — filtered to verified correct (skipped if no gold)
 
 Each line has: problem, answer, solution, correct, pred_answer,
-num_tokens_generated, alpha, difficulty (if available).
-
-The script is resumable: on restart it skips problems already in the output.
-Supports data-parallel generation across multiple GPUs.
+num_tokens_generated, temperature, top_p, difficulty (if available).
 
 Usage:
-    # Generate from DeepMath
-    uv run python -m scripts.rl.generate_power_demos \
+    uv run python -m scripts.rl.generate_demos \
         --model Qwen/Qwen3-4B \
-        --dataset deepmath \
-        --alpha 4.0 \
-        --max_problems 1000
-
-    # Generate from Polaris, specific difficulties
-    uv run python -m scripts.rl.generate_power_demos \
-        --model Qwen/Qwen3-4B \
-        --dataset polaris \
-        --difficulty 1/8 2/8 3/8 \
-        --alpha 3.0
-
-    # Multi-GPU data parallelism (auto-detects GPUs)
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m scripts.rl.generate_power_demos \
-        --model Qwen/Qwen3-4B \
-        --dataset deepmath \
-        --max_problems 1000
-
-    # Multi-GPU with tensor parallelism (TP=2, 4 GPUs → 2 workers)
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m scripts.rl.generate_power_demos \
-        --model Qwen/Qwen3-8B \
-        --dataset deepmath \
-        --tensor_parallel_size 2
-
-    # Explicit worker count
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m scripts.rl.generate_power_demos \
-        --model Qwen/Qwen3-4B \
-        --dataset deepmath \
-        --num_workers 4
+        --dataset synthetic \
+        --synthetic_file results/synthetic_questions/Qwen_Qwen3-4B/questions_accepted.jsonl \
+        --temperature 1.0 --top_p 0.95
 """
 
 import argparse
@@ -58,7 +30,7 @@ import time
 from datasets import load_dataset
 from tqdm import tqdm
 
-from scripts.utils import extract_boxed_answer, is_equiv
+from src.utils import extract_boxed_answer, is_equiv
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +181,7 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
 
     from transformers import AutoTokenizer
-    from scalable_power_sampling import VLLMBatchedPowerSampler
+    from vllm import LLM, SamplingParams
 
     # Reconstruct args
     args = argparse.Namespace(**args_dict)
@@ -219,22 +191,23 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
         template_tok = AutoTokenizer.from_pretrained(args.chat_template_model, trust_remote_code=True)
         tokenizer.chat_template = template_tok.chat_template
 
-    sampler = VLLMBatchedPowerSampler(
-        model_name=args.model,
-        alpha=args.alpha,
-        batch_size=args.batch_size,
-        num_candidates=args.num_candidates,
-        top_k=args.top_k,
-        num_rollouts=args.num_rollouts,
-        lookahead=args.lookahead,
-        max_new_tokens=args.max_tokens,
-        # Worker sees only its assigned GPUs (remapped to 0..TP-1)
+    llm = LLM(
+        model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
-        confidence_threshold=args.confidence_threshold,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        enable_prefix_caching=True,
+    )
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
     )
 
-    print(f"[Worker {rank}] GPUs {gpu_ids}, {len(problems)} problems, {sampler}")
+    print(f"[Worker {rank}] GPUs {gpu_ids}, {len(problems)} problems, "
+          f"temp={args.temperature} top_p={args.top_p}")
 
     correct_count = 0
     saved_count = 0
@@ -259,10 +232,16 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
             input_ids = tokenizer.encode(prompt_text)
 
             sample_t0 = time.time()
-            out = sampler.generate(input_ids=input_ids, verbose=False)
+            req_outs = llm.generate(
+                [{"prompt_token_ids": input_ids}],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+            completion = req_outs[0].outputs[0]
+            response = completion.text
+            num_tokens = len(completion.token_ids)
             sample_elapsed = time.time() - sample_t0
 
-            response = out["text"]
             pred_answer = extract_boxed_answer(response)
             if not pred_answer:
                 continue
@@ -289,9 +268,10 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
                 "solution": response,
                 "correct": correct,
                 "pred_answer": pred_answer,
-                "num_tokens_generated": out["num_tokens_generated"],
+                "num_tokens_generated": num_tokens,
                 "sample_time_s": round(sample_elapsed, 2),
-                "alpha": args.alpha,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
             }
             if prob.get("difficulty") is not None:
                 result["difficulty"] = prob["difficulty"]
@@ -305,7 +285,7 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
             pbar.update(1)
             postfix = {
                 "correct": ("n/a" if correct is None else f"{correct_count}/{saved_count}"),
-                "tokens": out["num_tokens_generated"],
+                "tokens": num_tokens,
                 "time": f"{sample_elapsed:.1f}s",
             }
             if max_responses is not None:
@@ -326,7 +306,7 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
 def _generate_sequential(problems: list[dict], args, all_path: str, num_already_done: int):
     """Generate solutions sequentially. Appends to all_path."""
     from transformers import AutoTokenizer
-    from scalable_power_sampling import VLLMBatchedPowerSampler
+    from vllm import LLM, SamplingParams
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if args.chat_template_model:
@@ -334,20 +314,21 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
         tokenizer.chat_template = template_tok.chat_template
         print(f"Using chat template from: {args.chat_template_model}")
 
-    sampler = VLLMBatchedPowerSampler(
-        model_name=args.model,
-        alpha=args.alpha,
-        batch_size=args.batch_size,
-        num_candidates=args.num_candidates,
-        top_k=args.top_k,
-        num_rollouts=args.num_rollouts,
-        lookahead=args.lookahead,
-        max_new_tokens=args.max_tokens,
+    llm = LLM(
+        model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
-        confidence_threshold=args.confidence_threshold,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        enable_prefix_caching=True,
     )
-    print(f"\n{sampler}\n")
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+    )
+    print(f"\nvLLM sampler (temp={args.temperature}, top_p={args.top_p}, max_tokens={args.max_tokens})\n")
 
     t0 = time.time()
     correct_count = 0
@@ -371,10 +352,16 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
             input_ids = tokenizer.encode(prompt_text)
 
             sample_t0 = time.time()
-            out = sampler.generate(input_ids=input_ids, verbose=False)
+            req_outs = llm.generate(
+                [{"prompt_token_ids": input_ids}],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+            completion = req_outs[0].outputs[0]
+            response = completion.text
+            num_tokens = len(completion.token_ids)
             sample_elapsed = time.time() - sample_t0
 
-            response = out["text"]
             pred_answer = extract_boxed_answer(response)
             if not pred_answer:
                 continue
@@ -389,9 +376,10 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
                 "solution": response,
                 "correct": correct,
                 "pred_answer": pred_answer,
-                "num_tokens_generated": out["num_tokens_generated"],
+                "num_tokens_generated": num_tokens,
                 "sample_time_s": round(sample_elapsed, 2),
-                "alpha": args.alpha,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
             }
             if prob.get("difficulty") is not None:
                 result["difficulty"] = prob["difficulty"]
@@ -401,21 +389,21 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
 
             saved_count += 1
             correct_count += int(correct is True)
-            total_tokens += out["num_tokens_generated"]
+            total_tokens += num_tokens
             global_saved = num_already_done + saved_count
 
             pbar.update(1)
             if correct is None:
                 postfix = {
                     "correct": "n/a",
-                    "tokens": out["num_tokens_generated"],
+                    "tokens": num_tokens,
                     "time": f"{sample_elapsed:.1f}s",
                 }
             else:
                 postfix = {
                     "correct": f"{correct_count}/{saved_count}",
                     "acc": f"{correct_count/saved_count*100:.1f}%",
-                    "tokens": out["num_tokens_generated"],
+                    "tokens": num_tokens,
                     "time": f"{sample_elapsed:.1f}s",
                 }
             if max_responses is not None:
@@ -454,11 +442,12 @@ def generate(args):
         dataset_slug = f"synthetic_{stem}"
     else:
         dataset_slug = args.dataset
-    output_dir = os.path.join(args.output_dir, dataset_slug, model_slug, f"alpha_{args.alpha}")
+    run_slug = f"temp_{args.temperature}_topp_{args.top_p}"
+    output_dir = os.path.join(args.output_dir, dataset_slug, model_slug, run_slug)
     os.makedirs(output_dir, exist_ok=True)
 
-    all_path = os.path.join(output_dir, "power_demos_all.jsonl")
-    correct_path = os.path.join(output_dir, "power_demos_correct.jsonl")
+    all_path = os.path.join(output_dir, "demos_all.jsonl")
+    correct_path = os.path.join(output_dir, "demos_correct.jsonl")
 
     # --- Resume: skip already-generated problems ---
     done = load_existing_results(all_path)
@@ -509,7 +498,7 @@ def generate(args):
 
         # Worker output files
         worker_paths = [
-            os.path.join(output_dir, f"power_demos_worker_{i}.jsonl")
+            os.path.join(output_dir, f"demos_worker_{i}.jsonl")
             for i in range(num_workers)
         ]
 
@@ -635,7 +624,7 @@ def _print_summary(all_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate power-sampled demonstrations for SDFT distillation"
+        description="Generate baseline demonstrations (plain vLLM sampling)"
     )
 
     # Model
@@ -658,32 +647,24 @@ def main():
                         help="Polaris difficulty filter (e.g. 1/8 2/8)")
     parser.add_argument("--seed", type=int, default=42)
 
-    # Power sampling
-    parser.add_argument("--alpha", type=float, default=4.0)
-    parser.add_argument("--top_k", type=int, default=8)
-    parser.add_argument("--num_rollouts", type=int, default=8)
-    parser.add_argument("--lookahead", type=int, default=192)
-    parser.add_argument("--batch_size", type=int, default=8,
-                        help="Tokens per chunk (B)")
-    parser.add_argument("--num_candidates", type=int, default=32,
-                        help="Candidate chunks per step (L)")
+    # Sampling
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--max_tokens", type=int, default=4096,
                         help="Max tokens per generation")
     parser.add_argument("--max_responses", type=int, default=None,
                         help="Stop after this many saved rows globally (across all workers, "
                              "counting any rows already on disk from a prior run).")
-    parser.add_argument("--confidence_threshold", type=float, default=None,
-                        help="Skip rollouts when top-1 vs top-2 gap exceeds this")
 
     # vLLM / parallelism
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
-                        help="GPUs per sampler instance (tensor parallelism)")
+                        help="GPUs per LLM instance (tensor parallelism)")
     parser.add_argument("--max_model_len", type=int, default=8192)
     parser.add_argument("--num_workers", type=int, default=None,
                         help="Number of parallel workers (default: auto = num_gpus // tensor_parallel_size)")
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results/power_demos")
+    parser.add_argument("--output_dir", type=str, default="results/demos")
 
     args = parser.parse_args()
     generate(args)

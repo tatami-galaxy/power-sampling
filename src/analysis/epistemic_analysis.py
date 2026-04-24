@@ -319,12 +319,12 @@ def generate_for_alpha_sweep(
     enable_thinking: bool | None = None,
 ) -> list[tuple[str, str]]:
     """Generate results for base + each alpha value. Returns (path, label) pairs."""
-    from scripts.eval.run_eval import (
+    from src.eval.run_eval import (
         evaluate_model,
         evaluate_model_power_sampling,
         save_results,
     )
-    from scripts.utils import DATASET_REGISTRY_EVAL
+    from src.utils import DATASET_REGISTRY_EVAL
     import random
 
     loader = DATASET_REGISTRY_EVAL[dataset]
@@ -428,13 +428,13 @@ def generate_teacher_conditioned(
 
     Returns (results_path, label).
     """
-    from scripts.eval.run_eval import save_results
-    from scripts.train_sdft import (
+    from src.eval.run_eval import save_results
+    from src.train_sdft import (
         SYSTEM_PROMPT as SDFT_SYSTEM_PROMPT,
         TEACHER_TEMPLATE_1,
         TEACHER_TEMPLATE_2,
     )
-    from scripts.utils import DATASET_REGISTRY_EVAL, extract_boxed_answer, is_equiv
+    from src.utils import DATASET_REGISTRY_EVAL, extract_boxed_answer, is_equiv
     import random
     import time
 
@@ -681,7 +681,7 @@ def main():
         # Teacher-conditioned generation (SDFT self-teacher)
         if args.include_teacher:
             # Load the same problem subset used by the alpha sweep
-            from scripts.utils import DATASET_REGISTRY_EVAL
+            from src.utils import DATASET_REGISTRY_EVAL
             import random as _rng
 
             loader = DATASET_REGISTRY_EVAL[args.dataset]

@@ -1,4 +1,3 @@
-from collections import defaultdict
 import re
 from datasets import load_dataset
 from math_verify import parse, verify

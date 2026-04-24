@@ -39,7 +39,7 @@ import time
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
-from scripts.utils import (
+from src.utils import (
     DATASET_REGISTRY_EVAL,
     extract_boxed_answer,
     is_equiv,

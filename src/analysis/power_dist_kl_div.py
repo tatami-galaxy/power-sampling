@@ -36,7 +36,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
-from scripts.utils import DATASET_REGISTRY_EVAL
+from src.utils import DATASET_REGISTRY_EVAL
 
 
 # ---------------------------------------------------------------------------
