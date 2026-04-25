@@ -5,6 +5,7 @@ KV-cache management. vLLM's PagedAttention, CUDA graphs, and automatic
 prefix caching handle the heavy lifting.
 """
 
+import time
 import torch
 from torch import Tensor
 
@@ -355,6 +356,7 @@ class VLLMBatchedPowerSampler:
                 )
 
         return rollout_ll
+
 
     def __repr__(self) -> str:
         return (

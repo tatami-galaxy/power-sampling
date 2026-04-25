@@ -53,6 +53,7 @@ def evaluate_model(
     max_model_len: int | None = 4096,
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
+    dtype: str = "bfloat16",
 ) -> dict:
     """Run evaluation and return results dict."""
     print(f"\n{'='*60}")
@@ -65,7 +66,7 @@ def evaluate_model(
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
-        dtype="bfloat16",
+        dtype=dtype,
     )
     if max_model_len is not None:
         llm_kwargs["max_model_len"] = max_model_len
@@ -129,8 +130,10 @@ def evaluate_model_power_sampling(
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     confidence_threshold: float | None = None,
+    use_jackknife: bool = False,
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
+    dtype: str = "bfloat16",
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
@@ -159,6 +162,8 @@ def evaluate_model_power_sampling(
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=max_model_len,
         confidence_threshold=confidence_threshold,
+        use_jackknife=use_jackknife,
+        dtype=dtype,
     )
     tokenizer = sampler.tokenizer
 
@@ -404,7 +409,7 @@ def main():
     )
     parser.add_argument("--output_dir", default="results")
     parser.add_argument("--max_tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--max_model_len", type=int, default=4096,
                         help="Max context length for vLLM KV cache. Use 0 for model default.")
@@ -438,6 +443,11 @@ def main():
                         help="Candidate chunks to generate per step for batched power sampling (L)")
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
+    parser.add_argument("--use_jackknife", action="store_true",
+                        help="Apply jackknife bias correction to power sampling (default: off)")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                        choices=["float16", "bfloat16", "float32", "auto"],
+                        help="Model dtype (default: bfloat16)")
     
 
     args = parser.parse_args()
@@ -480,6 +490,7 @@ def main():
             max_model_len=args.max_model_len or None,
             chat_template_tokenizer=chat_template_tokenizer,
             enable_thinking=args.enable_thinking,
+            dtype=args.dtype,
         )
         print_report(eval_output)
         save_results(eval_output, output_dir)
@@ -499,8 +510,10 @@ def main():
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len or None,
                 confidence_threshold=args.confidence_threshold,
+                use_jackknife=args.use_jackknife,
                 chat_template_tokenizer=chat_template_tokenizer,
                 enable_thinking=args.enable_thinking,
+                dtype=args.dtype,
             )
             print_report(ps_output)
             ps_dir = output_dir + "/" + ps_output["method"]
