@@ -212,12 +212,14 @@ def _apply_skip_mask(
     Reference impl uses skip_n=3 to suppress noisy KL on structural tokens
     (e.g. <think>, opening newlines) that have high variance.
     """
-    weight = torch.ones_like(per_token_kl)
-    idx = 0
-    for row in comp_mask:
-        n = int(row.sum().item())
-        weight[idx : idx + min(skip_n, n)] = 0.0
-        idx += n
+    # comp_mask: [B, max_Lc] bool, right-aligned.
+    counts = comp_mask.sum(dim=1)                               # [B] tokens per sequence
+    offsets = counts.cumsum(dim=0) - counts                     # [B] start offset in flat [N]
+    # Repeat each offset by its count to get the sequence-start for every flat token.
+    seq_offsets = offsets.repeat_interleave(counts)              # [N]
+    flat_idx = torch.arange(per_token_kl.shape[0], device=per_token_kl.device)
+    within_seq_idx = flat_idx - seq_offsets                     # position within its sequence
+    weight = (within_seq_idx >= skip_n).to(per_token_kl.dtype)
     return per_token_kl * weight
 
 
