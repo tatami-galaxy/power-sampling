@@ -232,6 +232,7 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
         confidence_threshold=args.confidence_threshold,
+        length_normalize=args.length_normalize,
     )
 
     print(f"[Worker {rank}] GPUs {gpu_ids}, {len(problems)} problems, {sampler}")
@@ -663,7 +664,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--num_rollouts", type=int, default=8)
     parser.add_argument("--lookahead", type=int, default=192)
-    parser.add_argument("--batch_size", type=int, default=8,
+    parser.add_argument("--batch_size", type=int, default=192,
                         help="Tokens per chunk (B)")
     parser.add_argument("--num_candidates", type=int, default=32,
                         help="Candidate chunks per step (L)")
@@ -674,6 +675,7 @@ def main():
                              "counting any rows already on disk from a prior run).")
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 gap exceeds this")
+    parser.add_argument("--length_normalize", action="store_true")
 
     # vLLM / parallelism
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
