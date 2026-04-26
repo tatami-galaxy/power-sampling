@@ -133,6 +133,8 @@ class VLLMBatchedPowerSampler:
             top_k_vals, top_k_idx = chunk_log_probs.topk(K)
             top_k_chunks = [chunk_ids[i] for i in top_k_idx.tolist()]
             top_k_log_probs = top_k_vals  # (K,)
+            remaining_after_chunk = self.max_new_tokens - ((step + 1) * B)
+            rollout_len = min(self.lookahead, remaining_after_chunk)
 
             # Identify candidates without EOS (rollouts after EOS are
             # meaningless — the future is empty so zeta=1, i.e. log_zeta=0,
@@ -146,8 +148,9 @@ class VLLMBatchedPowerSampler:
             else:
                 eos_free = list(range(K))
 
-            if not eos_free:
-                # All candidates contain EOS — fall back to low-temperature
+            if not eos_free or rollout_len <= 0:
+                # If all candidates terminate, or there is no future left to
+                # roll out, power sampling reduces to low-temperature sampling.
                 log_unnorm = self.alpha * top_k_log_probs
                 probs = torch.exp(
                     log_unnorm - torch.logsumexp(log_unnorm, dim=-1)
@@ -157,7 +160,7 @@ class VLLMBatchedPowerSampler:
                 # --- Lines 6-9: Generate rollouts for EOS-free candidates ---
                 eos_free_chunks = [top_k_chunks[i] for i in eos_free]
                 eos_free_ll = self._generate_rollouts(
-                    prefix_ids, eos_free_chunks
+                    prefix_ids, eos_free_chunks, rollout_len
                 )  # (len(eos_free), M)
 
                 # Full rollout_ll: zeros for EOS candidates (log_zeta=0)
@@ -290,6 +293,7 @@ class VLLMBatchedPowerSampler:
         self,
         prefix_ids: list[int],
         candidate_chunks: list[list[int]],
+        rollout_len: int,
     ) -> Tensor:
         """Generate M rollouts of H tokens for each of K candidate chunks.
 
@@ -299,6 +303,7 @@ class VLLMBatchedPowerSampler:
         Args:
             prefix_ids: Token IDs for the shared prefix.
             candidate_chunks: K lists of token IDs, one per candidate.
+            rollout_len: Number of future tokens to roll out.
 
         Returns:
             rollout_ll: Cumulative log-probs, shape (K, M).
@@ -314,10 +319,10 @@ class VLLMBatchedPowerSampler:
 
         params = SamplingParams(
             n=M,
-            max_tokens=self.lookahead,
+            max_tokens=rollout_len,
             temperature=1.0,
             logprobs=0,
-            ignore_eos=True,
+            ignore_eos=False,
         )
         outputs = self.llm.generate(
             rollout_prompts,
