@@ -129,7 +129,6 @@ def evaluate_model_power_sampling(
     num_candidates: int = 32,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
-    confidence_threshold: float | None = None,
     use_jackknife: bool = False,
     length_normalize: bool = False,
     chat_template_tokenizer=None,
@@ -146,8 +145,6 @@ def evaluate_model_power_sampling(
     print(f"Evaluating ({method}): {model_name}")
     print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
     print(f"  B={batch_size}, L={num_candidates}")
-    if confidence_threshold is not None:
-        print(f"  confidence_threshold={confidence_threshold}")
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
 
@@ -162,7 +159,6 @@ def evaluate_model_power_sampling(
         max_new_tokens=max_tokens,
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=max_model_len,
-        confidence_threshold=confidence_threshold,
         use_jackknife=use_jackknife,
         length_normalize=length_normalize,
         dtype=dtype,
@@ -217,8 +213,6 @@ def evaluate_model_power_sampling(
     }
     config["batch_size"] = batch_size
     config["num_candidates"] = num_candidates
-    if confidence_threshold is not None:
-        config["confidence_threshold"] = confidence_threshold
 
     return {
         "model": model_name,
@@ -439,12 +433,10 @@ def main():
                         help="Rollouts per candidate for power sampling")
     parser.add_argument("--lookahead", type=int, default=192,
                         help="Rollout horizon in tokens for power sampling")
-    parser.add_argument("--batch_size", type=int, default=8,
+    parser.add_argument("--batch_size", type=int, default=192,
                         help="Tokens per chunk for batched power sampling (B)")
     parser.add_argument("--num_candidates", type=int, default=32,
                         help="Candidate chunks to generate per step for batched power sampling (L)")
-    parser.add_argument("--confidence_threshold", type=float, default=None,
-                        help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
     parser.add_argument("--use_jackknife", action="store_true",
                         help="Apply jackknife bias correction to power sampling (default: off)")
     parser.add_argument("--length_normalize", action="store_true",
@@ -513,7 +505,6 @@ def main():
                 num_candidates=args.num_candidates,
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len or None,
-                confidence_threshold=args.confidence_threshold,
                 use_jackknife=args.use_jackknife,
                 length_normalize=args.length_normalize,
                 chat_template_tokenizer=chat_template_tokenizer,

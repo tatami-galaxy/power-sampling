@@ -42,9 +42,6 @@ class VLLMBatchedPowerSampler:
         tensor_parallel_size: GPUs for tensor parallelism. Default 1.
         max_model_len: Max context length for vLLM KV cache. Default 4096.
         dtype: Model dtype. Default "bfloat16".
-        confidence_threshold: If set, skip rollouts when the log-prob gap
-            between top-1 and top-2 candidates exceeds this value. Uses
-            low-temperature sampling instead. Default None (always run rollouts).
         length_normalize: If True, normalize cumulative log-probs by sequence
             length before scoring. Prevents length bias when chunks or rollouts
             terminate early at EOS. Default False.
@@ -64,7 +61,6 @@ class VLLMBatchedPowerSampler:
         tensor_parallel_size: int = 1,
         max_model_len: int = 8192,
         dtype: str = "bfloat16",
-        confidence_threshold: float | None = None,
         length_normalize: bool = False,
     ):
         self.alpha = alpha
@@ -75,7 +71,6 @@ class VLLMBatchedPowerSampler:
         self.lookahead = lookahead
         self.max_new_tokens = max_new_tokens
         self.use_jackknife = use_jackknife
-        self.confidence_threshold = confidence_threshold
         self.length_normalize = length_normalize
 
         self.llm = LLM(
@@ -139,33 +134,20 @@ class VLLMBatchedPowerSampler:
             top_k_chunks = [chunk_ids[i] for i in top_k_idx.tolist()]
             top_k_log_probs = top_k_vals  # (K,)
 
-            # Check if we can skip rollouts due to high confidence
-            skip_rollouts = (
-                self.alpha == 1.0
-                or (
-                    self.confidence_threshold is not None
-                    and K >= 2
-                    and (top_k_log_probs[0] - top_k_log_probs[1]).item()
-                    > self.confidence_threshold
-                )
-            )
-
             # Identify candidates without EOS (rollouts after EOS are
             # meaningless — the future is empty so zeta=1, i.e. log_zeta=0,
             # which reduces to pure low-temperature for that candidate)
-            if not skip_rollouts and self.eos_token_ids:
+            if self.eos_token_ids:
                 eos_free = [
                     i
                     for i, c in enumerate(top_k_chunks)
                     if self.eos_token_ids.isdisjoint(c)
                 ]
-                if not eos_free:
-                    skip_rollouts = True
             else:
                 eos_free = list(range(K))
 
-            if skip_rollouts:
-                # Low-temperature sampling from candidates directly
+            if not eos_free:
+                # All candidates contain EOS — fall back to low-temperature
                 log_unnorm = self.alpha * top_k_log_probs
                 probs = torch.exp(
                     log_unnorm - torch.logsumexp(log_unnorm, dim=-1)
@@ -233,13 +215,10 @@ class VLLMBatchedPowerSampler:
             top_k_vals, top_k_idx = chunk_log_probs.topk(K)
             top_k_chunks = [chunk_ids[i] for i in top_k_idx.tolist()]
 
-            if self.alpha > 1.0:
-                log_unnorm = self.alpha * top_k_vals
-                probs = torch.exp(log_unnorm - torch.logsumexp(log_unnorm, dim=-1))
-            else:
-                probs = torch.exp(
-                    top_k_vals - torch.logsumexp(top_k_vals, dim=-1)
-                )
+            log_unnorm = self.alpha * top_k_vals
+            probs = torch.exp(
+                log_unnorm - torch.logsumexp(log_unnorm, dim=-1)
+            )
 
             idx = torch.multinomial(probs, 1).item()
             selected_chunk = top_k_chunks[idx]
@@ -290,10 +269,8 @@ class VLLMBatchedPowerSampler:
             use_tqdm=False,
         )
 
-        # Deduplicate: keep highest log-prob for each unique chunk
-        seen: dict[tuple[int, ...], int] = {}
-        deduped_ids: list[list[int]] = []
-        deduped_lps: list[float] = []
+        all_ids: list[list[int]] = []
+        all_lps: list[float] = []
 
         for completion in outputs[0].outputs:
             ids = list(completion.token_ids)
@@ -303,17 +280,11 @@ class VLLMBatchedPowerSampler:
             lp = completion.cumulative_logprob
             if self.length_normalize and len(ids) > 0:
                 lp = lp / len(ids)
-            key = tuple(ids)
-            if key in seen:
-                idx = seen[key]
-                if lp > deduped_lps[idx]:
-                    deduped_lps[idx] = lp
-            else:
-                seen[key] = len(deduped_ids)
-                deduped_ids.append(ids)
-                deduped_lps.append(lp)
+            all_ids.append(ids)
+            all_lps.append(lp)
 
-        return deduped_ids, torch.tensor(deduped_lps)
+        return all_ids, torch.tensor(all_lps)
+
 
     def _generate_rollouts(
         self,
@@ -346,6 +317,7 @@ class VLLMBatchedPowerSampler:
             max_tokens=self.lookahead,
             temperature=1.0,
             logprobs=0,
+            ignore_eos=True,
         )
         outputs = self.llm.generate(
             rollout_prompts,
@@ -376,6 +348,5 @@ class VLLMBatchedPowerSampler:
             f"num_candidates={self.num_candidates}, top_k={self.top_k}, "
             f"num_rollouts={self.num_rollouts}, lookahead={self.lookahead}, "
             f"jackknife={self.use_jackknife}, "
-            f"confidence_threshold={self.confidence_threshold}, "
             f"length_normalize={self.length_normalize})"
         )
