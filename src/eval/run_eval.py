@@ -131,6 +131,7 @@ def evaluate_model_power_sampling(
     max_model_len: int = 4096,
     confidence_threshold: float | None = None,
     use_jackknife: bool = False,
+    length_normalize: bool = False,
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
     dtype: str = "bfloat16",
@@ -163,6 +164,7 @@ def evaluate_model_power_sampling(
         max_model_len=max_model_len,
         confidence_threshold=confidence_threshold,
         use_jackknife=use_jackknife,
+        length_normalize=length_normalize,
         dtype=dtype,
     )
     tokenizer = sampler.tokenizer
@@ -445,6 +447,8 @@ def main():
                         help="Skip rollouts when top-1 vs top-2 log-prob gap exceeds this value")
     parser.add_argument("--use_jackknife", action="store_true",
                         help="Apply jackknife bias correction to power sampling (default: off)")
+    parser.add_argument("--length_normalize", action="store_true",
+                        help="Normalize cumulative log-probs by sequence length")
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float16", "bfloat16", "float32", "auto"],
                         help="Model dtype (default: bfloat16)")
@@ -511,6 +515,7 @@ def main():
                 max_model_len=args.max_model_len or None,
                 confidence_threshold=args.confidence_threshold,
                 use_jackknife=args.use_jackknife,
+                length_normalize=args.length_normalize,
                 chat_template_tokenizer=chat_template_tokenizer,
                 enable_thinking=args.enable_thinking,
                 dtype=args.dtype,

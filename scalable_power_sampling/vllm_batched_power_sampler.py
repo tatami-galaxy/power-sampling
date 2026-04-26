@@ -32,7 +32,7 @@ class VLLMBatchedPowerSampler:
     Args:
         model_name: HuggingFace model name or local path.
         alpha: Power exponent (>=1). Default 4.0.
-        batch_size: Tokens per chunk (B). Default 8.
+        batch_size: Tokens per chunk (B). Default 192.
         num_candidates: Candidate chunks per step (L). Default 32.
         top_k: Candidates to keep (K). Default 8.
         num_rollouts: Rollouts per candidate (M). Default 8.
@@ -45,13 +45,16 @@ class VLLMBatchedPowerSampler:
         confidence_threshold: If set, skip rollouts when the log-prob gap
             between top-1 and top-2 candidates exceeds this value. Uses
             low-temperature sampling instead. Default None (always run rollouts).
+        length_normalize: If True, normalize cumulative log-probs by sequence
+            length before scoring. Prevents length bias when chunks or rollouts
+            terminate early at EOS. Default False.
     """
 
     def __init__(
         self,
         model_name: str,
         alpha: float = 4.0,
-        batch_size: int = 8,
+        batch_size: int = 192,
         num_candidates: int = 32,
         top_k: int = 8,
         num_rollouts: int = 8,
@@ -62,6 +65,7 @@ class VLLMBatchedPowerSampler:
         max_model_len: int = 8192,
         dtype: str = "bfloat16",
         confidence_threshold: float | None = None,
+        length_normalize: bool = False,
     ):
         self.alpha = alpha
         self.batch_size = batch_size
@@ -72,6 +76,7 @@ class VLLMBatchedPowerSampler:
         self.max_new_tokens = max_new_tokens
         self.use_jackknife = use_jackknife
         self.confidence_threshold = confidence_threshold
+        self.length_normalize = length_normalize
 
         self.llm = LLM(
             model=model_name,
@@ -85,8 +90,11 @@ class VLLMBatchedPowerSampler:
 
         eos = self.tokenizer.eos_token_id
         if isinstance(eos, list):
-            eos = eos[0]
-        self.eos_token_id = eos
+            self.eos_token_ids = set(eos)
+        elif eos is not None:
+            self.eos_token_ids = {eos}
+        else:
+            self.eos_token_ids = set()
 
     def generate(
         self,
@@ -145,11 +153,11 @@ class VLLMBatchedPowerSampler:
             # Identify candidates without EOS (rollouts after EOS are
             # meaningless — the future is empty so zeta=1, i.e. log_zeta=0,
             # which reduces to pure low-temperature for that candidate)
-            if not skip_rollouts and self.eos_token_id is not None:
+            if not skip_rollouts and self.eos_token_ids:
                 eos_free = [
                     i
                     for i, c in enumerate(top_k_chunks)
-                    if self.eos_token_id not in c
+                    if self.eos_token_ids.isdisjoint(c)
                 ]
                 if not eos_free:
                     skip_rollouts = True
@@ -202,12 +210,11 @@ class VLLMBatchedPowerSampler:
                 )
 
             # Check EOS within selected chunk
-            if self.eos_token_id is not None:
+            if self.eos_token_ids:
+                chunk_start = len(prefix_ids) - len(selected_chunk)
                 for pos, tid in enumerate(selected_chunk):
-                    if tid == self.eos_token_id:
-                        prefix_ids = prefix_ids[
-                            : prompt_len + step * B + pos + 1
-                        ]
+                    if tid in self.eos_token_ids:
+                        prefix_ids = prefix_ids[: chunk_start + pos + 1]
                         eos_hit = True
                         if verbose:
                             print(
@@ -238,12 +245,11 @@ class VLLMBatchedPowerSampler:
             selected_chunk = top_k_chunks[idx]
             prefix_ids = prefix_ids + selected_chunk
 
-            if self.eos_token_id is not None:
+            if self.eos_token_ids:
+                chunk_start = len(prefix_ids) - len(selected_chunk)
                 for pos, tid in enumerate(selected_chunk):
-                    if tid == self.eos_token_id:
-                        prefix_ids = prefix_ids[
-                            : len(prefix_ids) - len(selected_chunk) + pos + 1
-                        ]
+                    if tid in self.eos_token_ids:
+                        prefix_ids = prefix_ids[: chunk_start + pos + 1]
                         break
 
         generated_ids = prefix_ids[prompt_len:]
@@ -291,11 +297,12 @@ class VLLMBatchedPowerSampler:
 
         for completion in outputs[0].outputs:
             ids = list(completion.token_ids)
-            lp = (
-                completion.cumulative_logprob
-                if completion.cumulative_logprob is not None
-                else 0.0
+            assert completion.cumulative_logprob is not None, (
+                "cumulative_logprob is None — set logprobs>=1 in SamplingParams"
             )
+            lp = completion.cumulative_logprob
+            if self.length_normalize and len(ids) > 0:
+                lp = lp / len(ids)
             key = tuple(ids)
             if key in seen:
                 idx = seen[key]
@@ -349,11 +356,15 @@ class VLLMBatchedPowerSampler:
         rollout_ll = torch.zeros(K, M)
         for k, request_output in enumerate(outputs):
             for m, completion in enumerate(request_output.outputs):
-                rollout_ll[k, m] = (
-                    completion.cumulative_logprob
-                    if completion.cumulative_logprob is not None
-                    else 0.0
+                assert completion.cumulative_logprob is not None, (
+                    "cumulative_logprob is None — set logprobs>=1 in SamplingParams"
                 )
+                ll = completion.cumulative_logprob
+                if self.length_normalize:
+                    n_tokens = len(completion.token_ids)
+                    if n_tokens > 0:
+                        ll = ll / n_tokens
+                rollout_ll[k, m] = ll
 
         return rollout_ll
 
@@ -365,5 +376,6 @@ class VLLMBatchedPowerSampler:
             f"num_candidates={self.num_candidates}, top_k={self.top_k}, "
             f"num_rollouts={self.num_rollouts}, lookahead={self.lookahead}, "
             f"jackknife={self.use_jackknife}, "
-            f"confidence_threshold={self.confidence_threshold})"
+            f"confidence_threshold={self.confidence_threshold}, "
+            f"length_normalize={self.length_normalize})"
         )

@@ -20,38 +20,161 @@ GOLD_EXTRACTION_CONFIG = [
 ]
 
 
-def extract_boxed_answer(text: str) -> str | None:
-    """Extract the last \\boxed{...} answer from text, handling nested braces."""
-    idx = text.rfind("\\boxed{")
-    if idx == -1:
-        return None
+def _extract_braced(text: str, start: int) -> str | None:
+    """Extract content inside balanced braces starting at text[start] == '{'."""
     depth = 0
-    start = idx + len("\\boxed{")
     for i in range(start, len(text)):
         if text[i] == "{":
             depth += 1
         elif text[i] == "}":
-            if depth == 0:
-                return text[start:i]
             depth -= 1
+            if depth == 0:
+                return text[start + 1 : i]
     return None
+
+
+def extract_boxed_answer(text: str) -> str | None:
+    """Extract the last \\boxed{...} or \\fbox{...} from text, handling nested braces."""
+    for marker in ("\\boxed{", "\\fbox{"):
+        idx = text.rfind(marker)
+        if idx != -1:
+            return _extract_braced(text, idx + len(marker) - 1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Normalization helpers (ported from Hendrycks MATH / reasoning-with-sampling)
+# ---------------------------------------------------------------------------
+
+_UNITS_RE = re.compile(
+    r"(?:degree|cm|centimeter|meter|mile|second|minute|hour|day|week|month|year"
+    r"|foot|feet|inch|yard)(es|s)? *(\^[0-9]+)?",
+)
+
+
+def _fix_fracs(s: str) -> str:
+    r"""\\frac12 -> \\frac{1}{2}, etc."""
+    parts = s.split("\\frac")
+    if len(parts) < 2:
+        return s
+    out = parts[0]
+    for part in parts[1:]:
+        out += "\\frac"
+        if not part or part[0] == "{":
+            out += part
+            continue
+        if len(part) < 2:
+            out += part
+            continue
+        a, b = part[0], part[1]
+        if b != "{":
+            out += "{" + a + "}{" + b + "}" + part[2:]
+        else:
+            out += "{" + a + "}" + b + part[2:]
+    return out
+
+
+def _fix_sqrt(s: str) -> str:
+    r"""\\sqrt3 -> \\sqrt{3}."""
+    parts = s.split("\\sqrt")
+    if len(parts) < 2:
+        return s
+    out = parts[0]
+    for part in parts[1:]:
+        if not part or part[0] == "{":
+            out += "\\sqrt" + part
+        else:
+            out += "\\sqrt{" + part[0] + "}" + part[1:]
+    return out
+
+
+def _fix_a_slash_b(s: str) -> str:
+    r"""Simple a/b -> \\frac{a}{b} when both are integers."""
+    pieces = s.split("/")
+    if len(pieces) != 2:
+        return s
+    try:
+        a, b = int(pieces[0]), int(pieces[1])
+        return f"\\frac{{{a}}}{{{b}}}"
+    except ValueError:
+        return s
+
+
+def _strip_commas(s: str) -> str:
+    """Remove properly-formatted thousands commas: 1,000,000 -> 1000000."""
+    p = re.compile(r"(\d),(\d\d\d)(?=$|\D)")
+    while True:
+        new = p.sub(r"\1\2", s)
+        if new == s:
+            break
+        s = new
+    return s
 
 
 def _normalize(s: str) -> str:
     """Normalize a math answer string for string comparison."""
     s = s.strip()
+
+    # Remove dollar signs
+    s = s.replace("\\$", "")
     if s.startswith("$") and s.endswith("$"):
-        s = s[1:-1].strip()
+        s = s[1:-1]
+    s = s.replace("$", "")
+
+    # Remove percentage
+    s = s.replace("\\%", "").replace("%", "")
+
     # Remove \text{} wrapper
     m = re.fullmatch(r"\\text\{(.+)\}", s)
     if m:
         s = m.group(1).strip()
+
+    # Linebreaks and double backslash
+    s = s.replace("\n", "")
+    s = s.replace("\\\\", "\\")
+
+    # Frac variants -> \frac
+    s = s.replace("tfrac", "frac")
+    s = s.replace("dfrac", "frac")
+
     # Remove display commands
     s = s.replace("\\left", "").replace("\\right", "")
     s = s.replace("\\,", "").replace("\\;", "").replace("\\!", "")
-    s = re.sub(r"\\dfrac", r"\\frac", s)
+
+    # Remove degree markers
+    s = s.replace("^{\\circ}", "").replace("^\\circ", "")
+
+    # Remove units (including inside \text{})
+    s = re.sub(r"\\text\{\s*[^}]*\}", "", s)
+    s = _UNITS_RE.sub("", s)
+
+    # Strip outer braces {expr}
+    if len(s) > 1 and s[0] == "{" and s[-1] == "}":
+        s = s[1:-1]
+
+    # Leading zero: .5 -> 0.5
+    s = s.replace(" .", " 0.").replace("{.", "{0.")
+    if s.startswith("."):
+        s = "0" + s
+
+    # Variable prefix: "k = 5" -> "5"
+    if len(s.split("=")) == 2 and len(s.split("=")[0].strip()) <= 2:
+        s = s.split("=")[1]
+
+    # Fix shorthand: \frac12, \sqrt3
+    s = _fix_sqrt(s)
+    s = _fix_fracs(s)
+
+    # Thousands commas
+    s = _strip_commas(s)
+
+    # Remove all spaces
+    s = s.replace(" ", "")
+
+    # a/b -> \frac{a}{b} for simple integer fractions
+    s = _fix_a_slash_b(s)
+
     s = s.rstrip(".")
-    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
@@ -77,29 +200,74 @@ def _try_parse_number(s: str) -> float | None:
     return None
 
 
-def is_equiv(pred: str, gold: str) -> bool:
-    """Check equivalence using layered strategies:
-    1. Normalized string match (fast, handles most cases)
-    2. Numeric comparison (fractions, decimals)
-    3. math_verify symbolic comparison (fallback for complex expressions)
+_TUPLE_CHARS = "()[]"
+
+
+def _split_tuple(s: str) -> list[str]:
+    """Split a tuple/interval like '(a, b)' into elements ['a', 'b'].
+
+    Returns a single-element list [s] if s is not a tuple.
     """
-    pred_n = _normalize(pred)
-    gold_n = _normalize(gold)
-    # 1. Exact string match after normalization
+    s = _strip_commas(s)
+    if (
+        len(s) > 2
+        and s[0] in _TUPLE_CHARS
+        and s[-1] in _TUPLE_CHARS
+        and all(ch not in s[1:-1] for ch in _TUPLE_CHARS)
+    ):
+        return [e.strip() for e in s[1:-1].split(",")]
+    return [s]
+
+
+def _is_equiv_single(pred_n: str, gold_n: str, pred_raw: str, gold_raw: str) -> bool:
+    """Check equivalence of two scalar (non-tuple) normalized answers."""
     if pred_n == gold_n:
         return True
-    # 2. Numeric comparison
     pred_v = _try_parse_number(pred_n)
     gold_v = _try_parse_number(gold_n)
     if pred_v is not None and gold_v is not None:
         return abs(pred_v - gold_v) < 1e-6
-    # 3. Symbolic comparison via math_verify
     try:
-        gold_parsed = parse(gold, extraction_config=GOLD_EXTRACTION_CONFIG)
-        pred_parsed = parse(pred, extraction_config=PRED_EXTRACTION_CONFIG)
+        gold_parsed = parse(gold_raw, extraction_config=GOLD_EXTRACTION_CONFIG)
+        pred_parsed = parse(pred_raw, extraction_config=PRED_EXTRACTION_CONFIG)
         return verify(gold_parsed, pred_parsed)
     except Exception:
         return False
+
+
+def is_equiv(pred: str, gold: str) -> bool:
+    """Check equivalence using layered strategies:
+    1. Normalized string match (fast, handles most cases)
+    2. Tuple/interval element-wise comparison
+    3. Numeric comparison (fractions, decimals)
+    4. math_verify symbolic comparison (fallback for complex expressions)
+    """
+    pred_n = _normalize(pred)
+    gold_n = _normalize(gold)
+
+    # Fast path: full normalized match
+    if pred_n == gold_n:
+        return True
+
+    # Split into tuple elements
+    pred_elems = _split_tuple(pred_n)
+    gold_elems = _split_tuple(gold_n)
+
+    if len(pred_elems) != len(gold_elems):
+        # Length mismatch — fall through to single-value comparison
+        return _is_equiv_single(pred_n, gold_n, pred, gold)
+
+    if len(pred_elems) > 1:
+        # Tuple: require matching delimiters
+        if pred_n[0] != gold_n[0] or pred_n[-1] != gold_n[-1]:
+            return False
+        return all(
+            _is_equiv_single(pe, ge, pe, ge)
+            for pe, ge in zip(pred_elems, gold_elems)
+        )
+
+    # Scalar: full comparison with raw strings for math_verify fallback
+    return _is_equiv_single(pred_n, gold_n, pred, gold)
 
 
 # ---------------------------------------------------------------------------
