@@ -404,10 +404,10 @@ def main():
         help="Filter to specific MATH difficulty levels (1-5)",
     )
     parser.add_argument("--output_dir", default="results")
-    parser.add_argument("--max_tokens", type=int, default=2048)
+    parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--max_model_len", type=int, default=4096,
+    parser.add_argument("--max_model_len", type=int, default=8192,
                         help="Max context length for vLLM KV cache. Use 0 for model default.")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset of N samples (useful for quick tests)")

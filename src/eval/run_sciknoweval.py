@@ -1,30 +1,35 @@
 """
-Evaluate base vs. power-sampled generation on GPQA Diamond.
+Evaluate base vs. power-sampled generation on SciKnowEval.
 
-GPQA is a multiple-choice benchmark of PhD-level science questions (physics,
-chemistry, biology).  Answer choices are shuffled per-question with a
-deterministic seed to avoid position bias.
+Supports the Chemistry L-3 subset (default) and other domain/level combinations.
+Handles both MCQ (multiple-choice) and filling (free-text) question types.
 
 Usage:
-    # Base model only (greedy)
-    uv run python -m src.eval.run_gpqa \
+    # Chemistry L3 (default, matches SDFT paper)
+    uv run python -m src.eval.run_sciknoweval \
         --model Qwen/Qwen2.5-7B-Instruct
 
     # Base + power sampling
-    uv run python -m src.eval.run_gpqa \
+    uv run python -m src.eval.run_sciknoweval \
         --model Qwen/Qwen2.5-7B-Instruct \
         --power_sampling
 
-    # Quick test on 10 problems
-    uv run python -m src.eval.run_gpqa \
+    # Different domain/level
+    uv run python -m src.eval.run_sciknoweval \
         --model Qwen/Qwen2.5-7B-Instruct \
-        --power_sampling --num_samples 10
+        --domain Physics --level L3
+
+    # Only MCQ questions
+    uv run python -m src.eval.run_sciknoweval \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --question_type mcq
 """
 
 import argparse
 import json
 import os
 import random
+import re
 import time
 from collections import defaultdict
 
@@ -39,63 +44,86 @@ from src.utils import extract_boxed_answer
 # Prompt formatting
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. For the following multiple choice question, "
-    "reason step by step and put your final answer letter (A, B, C, or D) "
-    "in \\boxed{}."
+MCQ_SYSTEM_PROMPT = (
+    "You are a helpful science assistant. For the following multiple choice question, "
+    "reason step by step and put your final answer letter in \\boxed{}."
 )
 
-LABELS = ["A", "B", "C", "D"]
+FILLING_SYSTEM_PROMPT = (
+    "You are a helpful science assistant. Solve the following problem step by step. "
+    "Put your final answer in \\boxed{}."
+)
 
 
-def prepare_problem(row: dict, seed: int) -> dict:
-    """Shuffle answer choices and return a standardised problem dict.
-
-    Returns dict with: question, choices (list[str]), correct_label (A-D),
-    correct_answer (text), subdomain, and the formatted prompt string.
-    """
-    choices = [
-        row["Correct Answer"],
-        row["Incorrect Answer 1"],
-        row["Incorrect Answer 2"],
-        row["Incorrect Answer 3"],
-    ]
-    # Deterministic shuffle per question
-    rng = random.Random(seed)
-    order = list(range(4))
-    rng.shuffle(order)
-    shuffled = [choices[i] for i in order]
-    correct_label = LABELS[order.index(0)]  # where did index-0 (correct) land?
-
-    choice_block = "\n".join(
-        f"({label}) {text}" for label, text in zip(LABELS, shuffled)
-    )
-    prompt_text = f"{row['Question']}\n\n{choice_block}"
-
-    return {
-        "question": row["Question"],
-        "choices": shuffled,
-        "correct_label": correct_label,
-        "correct_answer": row["Correct Answer"],
-        "subdomain": row.get("Subdomain", ""),
-        "prompt_text": prompt_text,
-    }
-
-
-def format_messages(prompt_text: str) -> list[dict]:
+def format_mcq_prompt(prob: dict) -> list[dict]:
+    labels = prob["choices_label"]
+    texts = prob["choices_text"]
+    choice_block = "\n".join(f"({l}) {t}" for l, t in zip(labels, texts))
+    user = f"{prob['question']}\n\n{choice_block}"
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt_text},
+        {"role": "system", "content": MCQ_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
     ]
+
+
+def format_filling_prompt(prob: dict) -> list[dict]:
+    return [
+        {"role": "system", "content": FILLING_SYSTEM_PROMPT},
+        {"role": "user", "content": prob["question"]},
+    ]
+
+
+def format_messages(prob: dict) -> list[dict]:
+    if prob["type"] == "mcq":
+        return format_mcq_prompt(prob)
+    return format_filling_prompt(prob)
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_gpqa_diamond(seed: int = 42) -> list[dict]:
-    ds = load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
-    return [prepare_problem(row, seed=seed + i) for i, row in enumerate(ds)]
+def load_sciknoweval(
+    domain: str = "Chemistry",
+    level: str = "L3",
+    question_type: str | None = None,
+) -> list[dict]:
+    ds = load_dataset("hicai-zju/SciKnowEval", "v2", split="test")
+
+    problems = []
+    for row in ds:
+        if row["domain"] != domain:
+            continue
+        if row["details"]["level"] != level:
+            continue
+
+        is_mcq = row["type"].startswith("mcq") or row["type"] == "true_false"
+        q_type = "mcq" if is_mcq else "filling"
+
+        if question_type and q_type != question_type:
+            continue
+
+        prob = {
+            "question": row["question"],
+            "type": q_type,
+            "subtask": row["details"]["subtask"],
+            "source": row["details"]["source"],
+        }
+
+        if is_mcq:
+            prob["choices_label"] = row["choices"]["label"]
+            prob["choices_text"] = row["choices"]["text"]
+            prob["correct_label"] = row["answerKey"]
+            prob["answer"] = None
+        else:
+            prob["choices_label"] = []
+            prob["choices_text"] = []
+            prob["correct_label"] = None
+            prob["answer"] = row["answer"]
+
+        problems.append(prob)
+
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +176,7 @@ def generate_base(
 
     prompts = []
     for p in problems:
-        messages = format_messages(p["prompt_text"])
+        messages = format_messages(p)
         text = template_tok.apply_chat_template(messages, **template_kwargs)
         prompts.append(text)
 
@@ -176,7 +204,6 @@ def generate_power_sampling(
     max_tokens: int = 2048,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
-
     chat_template_model: str | None = None,
     enable_thinking: bool | None = None,
 ) -> list[str]:
@@ -211,7 +238,7 @@ def generate_power_sampling(
     t0 = time.time()
     pbar = tqdm(problems, desc="power_sampling", unit="problem")
     for prob in pbar:
-        messages = format_messages(prob["prompt_text"])
+        messages = format_messages(prob)
         text = template_tok.apply_chat_template(messages, **template_kwargs)
         input_ids = tokenizer.encode(text)
 
@@ -234,16 +261,28 @@ def generate_power_sampling(
 # Scoring
 # ---------------------------------------------------------------------------
 
-def extract_answer_label(response: str) -> str | None:
+def _normalize_chem(s: str) -> str:
+    """Light normalization for chemical equation comparison."""
+    s = s.strip()
+    # Remove whitespace around operators
+    s = re.sub(r"\s*\+\s*", " + ", s)
+    s = re.sub(r"\s*=\s*", " = ", s)
+    s = re.sub(r"\s*->\s*", " = ", s)
+    s = re.sub(r"\s*→\s*", " = ", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def extract_answer_label(response: str, labels: list[str]) -> str | None:
     """Extract the answer letter from a response.
 
-    Tries \\boxed{} first, then falls back to the last standalone A/B/C/D."""
+    Tries \\boxed{} first, then falls back to the last standalone label."""
     boxed = extract_boxed_answer(response)
-    if boxed and boxed.strip().upper() in LABELS:
+    if boxed and boxed.strip().upper() in labels:
         return boxed.strip().upper()
-    # Fallback: last occurrence of a standalone label
-    import re
-    matches = re.findall(r"\b([ABCD])\b", response)
+    label_pattern = "|".join(re.escape(l) for l in labels)
+    matches = re.findall(rf"\b({label_pattern})\b", response)
     if matches:
         return matches[-1].upper()
     return None
@@ -255,16 +294,35 @@ def score_responses(
 ) -> list[dict]:
     out = []
     for prob, response in zip(problems, responses):
-        pred = extract_answer_label(response)
-        correct = pred == prob["correct_label"] if pred else False
-        out.append({
-            "question": prob["question"][:200],
-            "correct_label": prob["correct_label"],
-            "pred_label": pred,
-            "correct": correct,
-            "subdomain": prob["subdomain"],
-            "response": response,
-        })
+        if prob["type"] == "mcq":
+            pred = extract_answer_label(response, prob["choices_label"])
+            correct = pred == prob["correct_label"] if pred else False
+            out.append({
+                "question": prob["question"][:200],
+                "type": prob["type"],
+                "subtask": prob["subtask"],
+                "correct_label": prob["correct_label"],
+                "pred_label": pred,
+                "correct": correct,
+                "response": response,
+            })
+        else:
+            # Filling: extract from \boxed{} and compare
+            pred = extract_boxed_answer(response)
+            if pred:
+                correct = _normalize_chem(pred) == _normalize_chem(prob["answer"])
+            else:
+                # Fallback: check if the gold answer appears in the response
+                correct = _normalize_chem(prob["answer"]) in _normalize_chem(response)
+            out.append({
+                "question": prob["question"][:200],
+                "type": prob["type"],
+                "subtask": prob["subtask"],
+                "correct_label": prob["answer"][:100] if prob["answer"] else None,
+                "pred_label": pred[:100] if pred else None,
+                "correct": correct,
+                "response": response,
+            })
     return out
 
 
@@ -283,19 +341,26 @@ def print_report(tag: str, scored: list[dict]):
         print(f"  Extraction failures: {no_answer}/{total}")
     print(f"{'='*60}")
 
-    # By subdomain
+    # By type
+    for qtype in ["mcq", "filling"]:
+        typed = [r for r in scored if r["type"] == qtype]
+        if typed:
+            tc = sum(r["correct"] for r in typed)
+            print(f"  {qtype}: {tc}/{len(typed)} = {tc/len(typed)*100:.1f}%")
+
+    # By subtask
     by_sub = defaultdict(lambda: {"correct": 0, "total": 0})
     for r in scored:
-        sub = r["subdomain"] or "Unknown"
-        by_sub[sub]["total"] += 1
-        by_sub[sub]["correct"] += int(r["correct"])
+        by_sub[r["subtask"]]["total"] += 1
+        by_sub[r["subtask"]]["correct"] += int(r["correct"])
 
-    print(f"\n{'Subdomain':<30} {'Correct':>8} {'Total':>6} {'Acc':>8}")
-    print("-" * 55)
-    for sub in sorted(by_sub):
-        d = by_sub[sub]
-        acc = d["correct"] / d["total"] * 100 if d["total"] else 0
-        print(f"{sub:<30} {d['correct']:>8} {d['total']:>6} {acc:>7.1f}%")
+    if len(by_sub) > 1:
+        print(f"\n{'Subtask':<40} {'Correct':>8} {'Total':>6} {'Acc':>8}")
+        print("-" * 65)
+        for sub in sorted(by_sub):
+            d = by_sub[sub]
+            acc = d["correct"] / d["total"] * 100 if d["total"] else 0
+            print(f"{sub:<40} {d['correct']:>8} {d['total']:>6} {acc:>7.1f}%")
 
 
 def print_comparison(base_scored: list[dict], power_scored: list[dict]):
@@ -334,21 +399,28 @@ def save_results(output_dir: str, tag: str, scored: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate base vs. power sampling on GPQA Diamond"
+        description="Evaluate base vs. power sampling on SciKnowEval"
     )
     parser.add_argument("--model", required=True)
-    parser.add_argument("--chat_template_model", default=None,
-                        help="Borrow chat template from this model (for base models)")
-    parser.add_argument("--output_dir", default="results/gpqa")
-    parser.add_argument("--max_tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--chat_template_model", default=None)
+    parser.add_argument("--output_dir", default="results/sciknoweval")
+    parser.add_argument("--max_tokens", type=int, default=2048)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--max_model_len", type=int, default=8192)
+    parser.add_argument("--max_model_len", type=int, default=4096)
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset (for quick tests)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
                         default=None)
+
+    # Dataset filters
+    parser.add_argument("--domain", default="Chemistry",
+                        help="Domain filter (default: Chemistry)")
+    parser.add_argument("--level", default="L3",
+                        help="Level filter (default: L3)")
+    parser.add_argument("--question_type", default=None, choices=["mcq", "filling"],
+                        help="Filter to a specific question type (default: all)")
 
     # Power sampling
     parser.add_argument("--power_sampling", action="store_true")
@@ -362,8 +434,21 @@ def main():
     args = parser.parse_args()
 
     # --- Load data ---
-    problems = load_gpqa_diamond(seed=args.seed)
-    print(f"Loaded {len(problems)} GPQA Diamond problems")
+    problems = load_sciknoweval(
+        domain=args.domain, level=args.level, question_type=args.question_type,
+    )
+    subset_tag = f"{args.domain}_{args.level}"
+    if args.question_type:
+        subset_tag += f"_{args.question_type}"
+    print(f"Loaded {len(problems)} SciKnowEval problems ({subset_tag})")
+
+    mcq_count = sum(1 for p in problems if p["type"] == "mcq")
+    fill_count = len(problems) - mcq_count
+    print(f"  MCQ: {mcq_count}, Filling: {fill_count}")
+
+    if not problems:
+        print("No problems found. Check --domain and --level filters.")
+        return
 
     if args.num_samples is not None and args.num_samples < len(problems):
         random.seed(args.seed)
@@ -371,7 +456,7 @@ def main():
         print(f"Subsampled to {args.num_samples} problems (seed={args.seed})")
 
     model_slug = args.model.replace("/", "_")
-    output_dir = os.path.join(args.output_dir, model_slug)
+    output_dir = os.path.join(args.output_dir, subset_tag, model_slug)
 
     # --- Base generation ---
     print(f"\n{'='*60}\nBase generation\n{'='*60}")
@@ -416,7 +501,10 @@ def main():
     # --- Summary ---
     summary = {
         "model": args.model,
+        "subset": subset_tag,
         "num_problems": len(problems),
+        "num_mcq": mcq_count,
+        "num_filling": fill_count,
         "base": {
             "temperature": args.temperature,
             "accuracy": sum(r["correct"] for r in base_scored) / len(base_scored),
@@ -433,7 +521,7 @@ def main():
             "accuracy": sum(r["correct"] for r in power_scored) / len(power_scored),
         }
 
-    summary_path = os.path.join(output_dir, "gpqa_summary.json")
+    summary_path = os.path.join(output_dir, "sciknoweval_summary.json")
     os.makedirs(output_dir, exist_ok=True)
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)

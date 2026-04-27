@@ -159,7 +159,7 @@ def generate_power_sampling(
     max_tokens: int = 1024,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
-    confidence_threshold: float | None = None,
+    use_jackknife: bool = False,
     chat_template_model: str | None = None,
 ) -> list[str]:
     from scalable_power_sampling import VLLMBatchedPowerSampler
@@ -175,7 +175,7 @@ def generate_power_sampling(
         max_new_tokens=max_tokens,
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=max_model_len,
-        confidence_threshold=confidence_threshold,
+        use_jackknife=use_jackknife,
     )
     tokenizer = sampler.tokenizer
 
@@ -324,10 +324,10 @@ def main():
     parser.add_argument("--chat_template_model", default=None,
                         help="Borrow chat template from this model (for base models)")
     parser.add_argument("--output_dir", default="results/humaneval")
-    parser.add_argument("--max_tokens", type=int, default=1024)
+    parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--max_model_len", type=int, default=4096)
+    parser.add_argument("--max_model_len", type=int, default=8192)
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset (for quick tests)")
     parser.add_argument("--seed", type=int, default=42)
@@ -344,7 +344,8 @@ def main():
                              "(completions are short; 192 would be mostly EOS).")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_candidates", type=int, default=32)
-    parser.add_argument("--confidence_threshold", type=float, default=None)
+    parser.add_argument("--use_jackknife", action="store_true",
+                        help="Apply jackknife bias correction to power sampling (default: off)")
 
     args = parser.parse_args()
 
@@ -392,7 +393,7 @@ def main():
             max_tokens=args.max_tokens,
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
-            confidence_threshold=args.confidence_threshold,
+            use_jackknife=args.use_jackknife,
             chat_template_model=args.chat_template_model,
         )
         power_scored = score_completions(problems, power_responses, timeout=args.timeout)
