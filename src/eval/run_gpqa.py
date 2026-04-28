@@ -45,6 +45,14 @@ SYSTEM_PROMPT = (
     "in \\boxed{}."
 )
 
+# Raw prompt from Power-SMC reference (constants.py:GPQA_QUERY_TEMPLATE)
+RAW_GPQA_TEMPLATE = (
+    "Answer the following multiple choice question. The last line of your "
+    "response should be of the following format: '\\boxed{{$LETTER}}' "
+    "(without quotes) where LETTER is one of ABCD (ex. '\\boxed{{A}}')."
+    "\n\n{Question}\n\nThink step by step before answering."
+)
+
 LABELS = ["A", "B", "C", "D"]
 
 
@@ -89,6 +97,19 @@ def format_messages(prompt_text: str) -> list[dict]:
     ]
 
 
+def build_gpqa_prompt(prompt_text: str, prompt_mode: str, tokenizer,
+                      template_tok=None, enable_thinking=None) -> str:
+    """Build a GPQA prompt string, respecting prompt_mode."""
+    if prompt_mode == "raw":
+        return RAW_GPQA_TEMPLATE.format(Question=prompt_text)
+    messages = format_messages(prompt_text)
+    tok = template_tok or tokenizer
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
+    return tok.apply_chat_template(messages, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -125,6 +146,7 @@ def generate_base(
     max_model_len: int = 4096,
     chat_template_model: str | None = None,
     enable_thinking: bool | None = None,
+    prompt_mode: str = "chat",
 ) -> list[str]:
     llm = LLM(
         model=model_name,
@@ -142,15 +164,11 @@ def generate_base(
             chat_template_model, trust_remote_code=True
         )
 
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
-
     prompts = []
     for p in problems:
-        messages = format_messages(p["prompt_text"])
-        text = template_tok.apply_chat_template(messages, **template_kwargs)
-        prompts.append(text)
+        prompts.append(build_gpqa_prompt(
+            p["prompt_text"], prompt_mode, tokenizer, template_tok, enable_thinking,
+        ))
 
     params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
     t0 = time.time()
@@ -176,9 +194,9 @@ def generate_power_sampling(
     max_tokens: int = 2048,
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
-
     chat_template_model: str | None = None,
     enable_thinking: bool | None = None,
+    prompt_mode: str = "chat",
 ) -> list[str]:
     from scalable_power_sampling import VLLMBatchedPowerSampler
 
@@ -203,16 +221,13 @@ def generate_power_sampling(
             chat_template_model, trust_remote_code=True
         )
 
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
-
     responses = []
     t0 = time.time()
     pbar = tqdm(problems, desc="power_sampling", unit="problem")
     for prob in pbar:
-        messages = format_messages(prob["prompt_text"])
-        text = template_tok.apply_chat_template(messages, **template_kwargs)
+        text = build_gpqa_prompt(
+            prob["prompt_text"], prompt_mode, tokenizer, template_tok, enable_thinking,
+        )
         input_ids = tokenizer.encode(text)
 
         sample_t0 = time.time()
@@ -236,7 +251,6 @@ def generate_power_smc(
     alpha: float = 4.0,
     n_particles: int = 64,
     ess_threshold: float = 0.5,
-    proposal_temperature: float | None = None,
     block_size: int = 64,
     alpha_ramp_tokens: int = 100,
     min_new_tokens: int = 0,
@@ -252,15 +266,17 @@ def generate_power_smc(
     stop_on_boxed: bool = True,
     use_cow_cache: bool = True,
     shared_prompt_cache: bool = True,
+    prompt_mode: str = "chat",
 ) -> list[str]:
     from scalable_power_sampling import HFPowerSMCSampler
 
+    temperature = 1.0 / alpha
     sampler = HFPowerSMCSampler(
         model_name=model_name,
         alpha=alpha,
         n_particles=n_particles,
         ess_threshold=ess_threshold,
-        proposal_temperature=proposal_temperature,
+        proposal_temperature=temperature,
         block_size=block_size,
         alpha_ramp_tokens=alpha_ramp_tokens,
         max_new_tokens=max_tokens,
@@ -284,16 +300,13 @@ def generate_power_smc(
             chat_template_model, trust_remote_code=True
         )
 
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
-
     responses = []
     t0 = time.time()
     pbar = tqdm(problems, desc="power_smc", unit="problem")
     for prob in pbar:
-        messages = format_messages(prob["prompt_text"])
-        text = template_tok.apply_chat_template(messages, **template_kwargs)
+        text = build_gpqa_prompt(
+            prob["prompt_text"], prompt_mode, tokenizer, template_tok, enable_thinking,
+        )
         input_ids = tokenizer.encode(text)
 
         sample_t0 = time.time()
@@ -423,6 +436,10 @@ def main():
     parser.add_argument("--chat_template_model", default=None,
                         help="Borrow chat template from this model (for base models)")
     parser.add_argument("--output_dir", default="results/gpqa")
+    parser.add_argument("--prompt_mode", type=str, default="chat",
+                        choices=["chat", "raw"],
+                        help="Prompt format: 'chat' uses system+user chat template, "
+                             "'raw' uses plain GPQA template (matches Power-SMC reference)")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
@@ -447,12 +464,10 @@ def main():
     parser.add_argument("--smc_particles", type=int, default=64)
     parser.add_argument("--smc_ess_threshold", type=float, default=0.5)
     parser.add_argument("--smc_block_size", type=int, default=64)
-    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100)
-    parser.add_argument("--smc_temperature", type=float, default=None,
-                        help="Fixed Power-SMC proposal temperature. Defaults to 1/alpha")
-    parser.add_argument("--smc_min_new_tokens", type=int, default=0)
+    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=400)
+    parser.add_argument("--smc_min_new_tokens", type=int, default=100)
     parser.add_argument("--smc_top_k", type=int, default=0)
-    parser.add_argument("--smc_top_p", type=float, default=1.0)
+    parser.add_argument("--smc_top_p", type=float, default=0.9)
     parser.add_argument("--smc_repetition_penalty", type=float, default=1.0)
     parser.add_argument("--no_smc_stop_on_boxed", action="store_true")
     parser.add_argument("--no_smc_cow_cache", action="store_true")
@@ -485,6 +500,7 @@ def main():
         max_model_len=args.max_model_len,
         chat_template_model=args.chat_template_model,
         enable_thinking=args.enable_thinking,
+        prompt_mode=args.prompt_mode,
     )
     base_scored = score_responses(problems, base_responses)
     print_report("Base", base_scored)
@@ -508,6 +524,7 @@ def main():
             max_model_len=args.max_model_len,
             chat_template_model=args.chat_template_model,
             enable_thinking=args.enable_thinking,
+            prompt_mode=args.prompt_mode,
         )
         power_scored = score_responses(problems, power_responses)
         print_report("Power", power_scored)
@@ -524,7 +541,6 @@ def main():
             alpha=args.alpha,
             n_particles=args.smc_particles,
             ess_threshold=args.smc_ess_threshold,
-            proposal_temperature=args.smc_temperature,
             block_size=args.smc_block_size,
             alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
             min_new_tokens=args.smc_min_new_tokens,
@@ -540,6 +556,7 @@ def main():
             stop_on_boxed=not args.no_smc_stop_on_boxed,
             use_cow_cache=not args.no_smc_cow_cache,
             shared_prompt_cache=not args.no_smc_shared_prompt_cache,
+            prompt_mode=args.prompt_mode,
         )
         smc_scored = score_responses(problems, smc_responses)
         print_report("Power-SMC", smc_scored)
@@ -570,10 +587,7 @@ def main():
             "alpha": args.alpha,
             "n_particles": args.smc_particles,
             "ess_threshold": args.smc_ess_threshold,
-            "proposal_temperature": args.smc_temperature,
-            "effective_proposal_temperature": (
-                args.smc_temperature if args.smc_temperature is not None else 1.0 / args.alpha
-            ),
+            "temperature": 1.0 / args.alpha,
             "block_size": args.smc_block_size,
             "alpha_ramp_tokens": args.smc_alpha_ramp_tokens,
             "top_k": args.smc_top_k,

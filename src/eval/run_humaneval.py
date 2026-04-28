@@ -40,16 +40,27 @@ SYSTEM_PROMPT = (
     "Return only code, wrapped in a ```python ... ``` block."
 )
 
+RAW_HUMANEVAL_PROMPT = "Write a Python function to solve the following problem:\n\n"
 
-def format_prompt(problem_text: str) -> list[dict]:
-    user = (
-        "Write a Python function to solve the following problem:\n\n"
-        + problem_text
-    )
+
+def format_prompt_chat(problem_text: str) -> list[dict]:
+    user = RAW_HUMANEVAL_PROMPT + problem_text
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
+
+
+def build_humaneval_prompt(problem_text: str, prompt_mode: str, tokenizer,
+                           template_tok=None) -> str:
+    """Build a HumanEval prompt string, respecting prompt_mode."""
+    if prompt_mode == "raw":
+        return RAW_HUMANEVAL_PROMPT + problem_text
+    messages = format_prompt_chat(problem_text)
+    tok = template_tok or tokenizer
+    return tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
 
 _FENCE_RE = re.compile(r"```(?:python|py)?\s*\n?(.*?)```", re.DOTALL)
@@ -109,6 +120,7 @@ def generate_base(
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     chat_template_model: str | None = None,
+    prompt_mode: str = "chat",
 ) -> list[str]:
     """Generate one completion per problem via vLLM."""
     llm = LLM(
@@ -129,11 +141,9 @@ def generate_base(
 
     prompts = []
     for p in problems:
-        messages = format_prompt(p["prompt"])
-        text = template_tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        prompts.append(text)
+        prompts.append(build_humaneval_prompt(
+            p["prompt"], prompt_mode, tokenizer, template_tok,
+        ))
 
     params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
     t0 = time.time()
@@ -161,6 +171,7 @@ def generate_power_sampling(
     max_model_len: int = 4096,
     use_jackknife: bool = False,
     chat_template_model: str | None = None,
+    prompt_mode: str = "chat",
 ) -> list[str]:
     from scalable_power_sampling import VLLMBatchedPowerSampler
 
@@ -190,9 +201,8 @@ def generate_power_sampling(
     t0 = time.time()
     pbar = tqdm(problems, desc="power_sampling", unit="problem")
     for prob in pbar:
-        messages = format_prompt(prob["prompt"])
-        text = template_tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        text = build_humaneval_prompt(
+            prob["prompt"], prompt_mode, tokenizer, template_tok,
         )
         input_ids = tokenizer.encode(text)
 
@@ -217,7 +227,6 @@ def generate_power_smc(
     alpha: float = 4.0,
     n_particles: int = 64,
     ess_threshold: float = 0.5,
-    proposal_temperature: float | None = None,
     block_size: int = 64,
     alpha_ramp_tokens: int = 100,
     min_new_tokens: int = 0,
@@ -232,15 +241,17 @@ def generate_power_smc(
     stop_on_boxed: bool = False,
     use_cow_cache: bool = True,
     shared_prompt_cache: bool = True,
+    prompt_mode: str = "chat",
 ) -> list[str]:
     from scalable_power_sampling import HFPowerSMCSampler
 
+    temperature = 1.0 / alpha
     sampler = HFPowerSMCSampler(
         model_name=model_name,
         alpha=alpha,
         n_particles=n_particles,
         ess_threshold=ess_threshold,
-        proposal_temperature=proposal_temperature,
+        proposal_temperature=temperature,
         block_size=block_size,
         alpha_ramp_tokens=alpha_ramp_tokens,
         max_new_tokens=max_tokens,
@@ -268,9 +279,8 @@ def generate_power_smc(
     t0 = time.time()
     pbar = tqdm(problems, desc="power_smc", unit="problem")
     for prob in pbar:
-        messages = format_prompt(prob["prompt"])
-        text = template_tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        text = build_humaneval_prompt(
+            prob["prompt"], prompt_mode, tokenizer, template_tok,
         )
         input_ids = tokenizer.encode(text)
 
@@ -404,6 +414,10 @@ def main():
     parser.add_argument("--chat_template_model", default=None,
                         help="Borrow chat template from this model (for base models)")
     parser.add_argument("--output_dir", default="results/humaneval")
+    parser.add_argument("--prompt_mode", type=str, default="chat",
+                        choices=["chat", "raw"],
+                        help="Prompt format: 'chat' uses system+user chat template, "
+                             "'raw' uses plain string")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
@@ -432,12 +446,10 @@ def main():
     parser.add_argument("--smc_particles", type=int, default=64)
     parser.add_argument("--smc_ess_threshold", type=float, default=0.5)
     parser.add_argument("--smc_block_size", type=int, default=64)
-    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100)
-    parser.add_argument("--smc_temperature", type=float, default=None,
-                        help="Fixed Power-SMC proposal temperature. Defaults to 1/alpha")
-    parser.add_argument("--smc_min_new_tokens", type=int, default=0)
+    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=400)
+    parser.add_argument("--smc_min_new_tokens", type=int, default=100)
     parser.add_argument("--smc_top_k", type=int, default=0)
-    parser.add_argument("--smc_top_p", type=float, default=1.0)
+    parser.add_argument("--smc_top_p", type=float, default=0.9)
     parser.add_argument("--smc_repetition_penalty", type=float, default=1.0)
     parser.add_argument("--smc_stop_on_boxed", action="store_true",
                         help="Stop Power-SMC particles after a boxed answer; off by default for code")
@@ -471,6 +483,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
         chat_template_model=args.chat_template_model,
+        prompt_mode=args.prompt_mode,
     )
     base_scored = score_completions(problems, base_responses, timeout=args.timeout)
     print_report("Base", base_scored)
@@ -494,6 +507,7 @@ def main():
             max_model_len=args.max_model_len,
             use_jackknife=args.use_jackknife,
             chat_template_model=args.chat_template_model,
+            prompt_mode=args.prompt_mode,
         )
         power_scored = score_completions(problems, power_responses, timeout=args.timeout)
         print_report("Power", power_scored)
@@ -510,7 +524,6 @@ def main():
             alpha=args.alpha,
             n_particles=args.smc_particles,
             ess_threshold=args.smc_ess_threshold,
-            proposal_temperature=args.smc_temperature,
             block_size=args.smc_block_size,
             alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
             min_new_tokens=args.smc_min_new_tokens,
@@ -525,6 +538,7 @@ def main():
             stop_on_boxed=args.smc_stop_on_boxed,
             use_cow_cache=not args.no_smc_cow_cache,
             shared_prompt_cache=not args.no_smc_shared_prompt_cache,
+            prompt_mode=args.prompt_mode,
         )
         smc_scored = score_completions(problems, smc_responses, timeout=args.timeout)
         print_report("Power-SMC", smc_scored)
@@ -555,10 +569,7 @@ def main():
             "alpha": args.alpha,
             "n_particles": args.smc_particles,
             "ess_threshold": args.smc_ess_threshold,
-            "proposal_temperature": args.smc_temperature,
-            "effective_proposal_temperature": (
-                args.smc_temperature if args.smc_temperature is not None else 1.0 / args.alpha
-            ),
+            "temperature": 1.0 / args.alpha,
             "block_size": args.smc_block_size,
             "alpha_ramp_tokens": args.smc_alpha_ramp_tokens,
             "top_k": args.smc_top_k,
