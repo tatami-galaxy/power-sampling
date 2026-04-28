@@ -360,14 +360,14 @@ def smc_power_sample(
     cow_active = False
     logical_to_physical = None
     n_physical = n_particles
+    proposal_temperature = (
+        float(cfg.proposal_temperature)
+        if cfg.proposal_temperature is not None
+        else 1.0 / alpha_final
+    )
 
     for t in range(int(cfg.max_new_tokens)):
         alpha_t = _alpha_ramp(t=t, alpha_final=alpha_final, ramp_tokens=ramp_tokens)
-        proposal_temperature = (
-            float(cfg.proposal_temperature)
-            if cfg.proposal_temperature is not None
-            else 1.0 / float(alpha_t)
-        )
 
         base_logprobs_phys = F.log_softmax(last_logits.float(), dim=-1)
         if proposal_temperature == 1.0:

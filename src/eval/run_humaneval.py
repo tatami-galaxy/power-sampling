@@ -434,7 +434,7 @@ def main():
     parser.add_argument("--smc_block_size", type=int, default=64)
     parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100)
     parser.add_argument("--smc_temperature", type=float, default=None,
-                        help="Fixed Power-SMC proposal temperature. Defaults to adaptive 1/alpha_t")
+                        help="Fixed Power-SMC proposal temperature. Defaults to 1/alpha")
     parser.add_argument("--smc_min_new_tokens", type=int, default=0)
     parser.add_argument("--smc_top_k", type=int, default=0)
     parser.add_argument("--smc_top_p", type=float, default=1.0)
@@ -556,6 +556,9 @@ def main():
             "n_particles": args.smc_particles,
             "ess_threshold": args.smc_ess_threshold,
             "proposal_temperature": args.smc_temperature,
+            "effective_proposal_temperature": (
+                args.smc_temperature if args.smc_temperature is not None else 1.0 / args.alpha
+            ),
             "block_size": args.smc_block_size,
             "alpha_ramp_tokens": args.smc_alpha_ramp_tokens,
             "top_k": args.smc_top_k,

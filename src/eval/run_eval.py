@@ -344,7 +344,7 @@ def evaluate_model_power_smc(
         "n_particles": n_particles,
         "ess_threshold": ess_threshold,
         "proposal_temperature": proposal_temperature,
-        "effective_initial_proposal_temperature": effective_temperature,
+        "effective_proposal_temperature": effective_temperature,
         "block_size": block_size,
         "alpha_ramp_tokens": alpha_ramp_tokens,
         "min_new_tokens": min_new_tokens,
@@ -598,7 +598,7 @@ def main():
     parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100,
                         help="Linearly ramp alpha over the first N generated tokens")
     parser.add_argument("--smc_temperature", type=float, default=None,
-                        help="Fixed Power-SMC proposal temperature. Defaults to adaptive 1/alpha_t")
+                        help="Fixed Power-SMC proposal temperature. Defaults to 1/alpha")
     parser.add_argument("--smc_min_new_tokens", type=int, default=0,
                         help="Suppress EOS for this many generated tokens")
     parser.add_argument("--smc_top_k", type=int, default=0,

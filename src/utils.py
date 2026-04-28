@@ -196,11 +196,29 @@ def _normalize(s: str) -> str:
     # Thousands commas
     s = _strip_commas(s)
 
+    # "or" / "and" → comma (so "2 or -2" matches "(2, -2)")
+    s = re.sub(r"\s+or\s+", ", ", s)
+    s = re.sub(r"\s+and\s+", ", ", s)
+
+    # Mixed numbers: "7 3/4" → "7+3/4"
+    s = re.sub(r"(\d)\s+(\d)", r"\1+\2", s)
+
     # Remove all spaces
     s = s.replace(" ", "")
 
     # a/b -> \frac{a}{b} for simple integer fractions
     s = _fix_a_slash_b(s)
+
+    # Normalize integer-valued floats: "2.0" → "2"
+    try:
+        v = float(s.replace(",", ""))
+        if v == int(v) and abs(v) < 1e15:
+            s = str(int(v))
+    except (ValueError, OverflowError):
+        pass
+
+    # Case-insensitive for text answers
+    s = s.lower()
 
     s = s.rstrip(".")
     return s
