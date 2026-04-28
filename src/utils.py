@@ -20,25 +20,53 @@ GOLD_EXTRACTION_CONFIG = [
 ]
 
 
-def _extract_braced(text: str, start: int) -> str | None:
-    """Extract content inside balanced braces starting at text[start] == '{'."""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start + 1 : i]
-    return None
-
-
 def extract_boxed_answer(text: str) -> str | None:
-    """Extract the last \\boxed{...} or \\fbox{...} from text, handling nested braces."""
-    for marker in ("\\boxed{", "\\fbox{"):
-        idx = text.rfind(marker)
-        if idx != -1:
-            return _extract_braced(text, idx + len(marker) - 1)
+    """Extract the rightmost non-empty \\boxed{...} or \\fbox{...} answer.
+
+    This mirrors the Power-SMC extractor behavior: search both box macros
+    together from right to left, handle nested braces, and skip empty template
+    boxes like ``\\boxed{}`` or ``\\boxed{{}}``.
+    """
+    candidates = []
+    for macro in ("\\boxed", "\\fbox"):
+        start = 0
+        while True:
+            idx = text.find(macro, start)
+            if idx < 0:
+                break
+            candidates.append((idx, macro))
+            start = idx + len(macro)
+
+    for idx, macro in sorted(candidates, reverse=True):
+        brace_idx = idx + len(macro)
+        while brace_idx < len(text) and text[brace_idx].isspace():
+            brace_idx += 1
+        if brace_idx >= len(text) or text[brace_idx] != "{":
+            continue
+
+        depth = 0
+        right = None
+        for pos in range(brace_idx, len(text)):
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    right = pos
+                    break
+
+        if right is None:
+            continue
+
+        content = text[brace_idx + 1 : right].strip()
+        while len(content) >= 2 and content[0] == "{" and content[-1] == "}":
+            inner = content[1:-1].strip()
+            if inner == content:
+                break
+            content = inner
+        if content and content.replace("{", "").replace("}", "").strip():
+            return content
+
     return None
 
 

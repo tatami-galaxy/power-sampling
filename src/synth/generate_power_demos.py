@@ -1,8 +1,8 @@
 """
 Generate power-sampled demonstrations for SDFT distillation.
 
-Uses VLLMBatchedPowerSampler to generate high-quality solutions from the
-model's own sharpened distribution pi_alpha, then verifies correctness
+Uses power sampling to generate high-quality solutions from the model's own
+sharpened distribution pi_alpha, then verifies correctness
 against gold answers.  Saves results as JSONL compatible with train_sdft.py.
 
 Output files:
@@ -191,6 +191,56 @@ def load_existing_results(output_path: str) -> set[str]:
     return done
 
 
+def _build_sampler(args):
+    """Construct the requested sampler after CUDA visibility has been set."""
+    if args.sampler == "power_smc":
+        from scalable_power_sampling import HFPowerSMCSampler
+
+        return HFPowerSMCSampler(
+            model_name=args.model,
+            alpha=args.alpha,
+            n_particles=args.smc_particles,
+            ess_threshold=args.smc_ess_threshold,
+            proposal_temperature=args.smc_temperature,
+            block_size=args.smc_block_size,
+            alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
+            max_new_tokens=args.max_tokens,
+            min_new_tokens=args.smc_min_new_tokens,
+            repetition_penalty=args.smc_repetition_penalty,
+            top_k=args.smc_top_k,
+            top_p=args.smc_top_p,
+            tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+            dtype=args.dtype,
+            stop_on_boxed=not args.no_smc_stop_on_boxed,
+            use_cow_cache=not args.no_smc_cow_cache,
+            shared_prompt_cache=not args.no_smc_shared_prompt_cache,
+        )
+
+    from scalable_power_sampling import VLLMBatchedPowerSampler
+    import inspect
+
+    sampler_kwargs = {
+        "model_name": args.model,
+        "alpha": args.alpha,
+        "batch_size": args.batch_size,
+        "num_candidates": args.num_candidates,
+        "top_k": args.top_k,
+        "num_rollouts": args.num_rollouts,
+        "lookahead": args.lookahead,
+        "max_new_tokens": args.max_tokens,
+        # Worker sees only its assigned GPUs (remapped to 0..TP-1).
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_model_len": args.max_model_len,
+        "length_normalize": args.length_normalize,
+        "dtype": args.dtype,
+    }
+    signature = inspect.signature(VLLMBatchedPowerSampler.__init__)
+    if "confidence_threshold" in signature.parameters:
+        sampler_kwargs["confidence_threshold"] = args.confidence_threshold
+    return VLLMBatchedPowerSampler(**sampler_kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Worker: generates solutions for a shard of problems on assigned GPUs
 # ---------------------------------------------------------------------------
@@ -209,7 +259,6 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
 
     from transformers import AutoTokenizer
-    from scalable_power_sampling import VLLMBatchedPowerSampler
 
     # Reconstruct args
     args = argparse.Namespace(**args_dict)
@@ -219,21 +268,7 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
         template_tok = AutoTokenizer.from_pretrained(args.chat_template_model, trust_remote_code=True)
         tokenizer.chat_template = template_tok.chat_template
 
-    sampler = VLLMBatchedPowerSampler(
-        model_name=args.model,
-        alpha=args.alpha,
-        batch_size=args.batch_size,
-        num_candidates=args.num_candidates,
-        top_k=args.top_k,
-        num_rollouts=args.num_rollouts,
-        lookahead=args.lookahead,
-        max_new_tokens=args.max_tokens,
-        # Worker sees only its assigned GPUs (remapped to 0..TP-1)
-        tensor_parallel_size=args.tensor_parallel_size,
-        max_model_len=args.max_model_len,
-        confidence_threshold=args.confidence_threshold,
-        length_normalize=args.length_normalize,
-    )
+    sampler = _build_sampler(args)
 
     print(f"[Worker {rank}] GPUs {gpu_ids}, {len(problems)} problems, {sampler}")
 
@@ -293,7 +328,10 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
                 "num_tokens_generated": out["num_tokens_generated"],
                 "sample_time_s": round(sample_elapsed, 2),
                 "alpha": args.alpha,
+                "sampler": args.sampler,
             }
+            if "stats" in out:
+                result["smc_stats"] = out["stats"]
             if prob.get("difficulty") is not None:
                 result["difficulty"] = prob["difficulty"]
 
@@ -309,6 +347,8 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
                 "tokens": out["num_tokens_generated"],
                 "time": f"{sample_elapsed:.1f}s",
             }
+            if "stats" in out:
+                postfix["resamples"] = out["stats"].get("resample_count", 0)
             if max_responses is not None:
                 postfix["global"] = f"{global_saved}/{max_responses}"
             else:
@@ -327,7 +367,6 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
 def _generate_sequential(problems: list[dict], args, all_path: str, num_already_done: int):
     """Generate solutions sequentially. Appends to all_path."""
     from transformers import AutoTokenizer
-    from scalable_power_sampling import VLLMBatchedPowerSampler
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if args.chat_template_model:
@@ -335,19 +374,7 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
         tokenizer.chat_template = template_tok.chat_template
         print(f"Using chat template from: {args.chat_template_model}")
 
-    sampler = VLLMBatchedPowerSampler(
-        model_name=args.model,
-        alpha=args.alpha,
-        batch_size=args.batch_size,
-        num_candidates=args.num_candidates,
-        top_k=args.top_k,
-        num_rollouts=args.num_rollouts,
-        lookahead=args.lookahead,
-        max_new_tokens=args.max_tokens,
-        tensor_parallel_size=args.tensor_parallel_size,
-        max_model_len=args.max_model_len,
-        confidence_threshold=args.confidence_threshold,
-    )
+    sampler = _build_sampler(args)
     print(f"\n{sampler}\n")
 
     t0 = time.time()
@@ -357,7 +384,7 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
     max_responses = args.max_responses
 
     with open(all_path, "a") as f_all:
-        pbar = tqdm(total=len(problems), desc="power sampling", unit="response")
+        pbar = tqdm(total=len(problems), desc=args.sampler, unit="response")
         for prob in problems:
             if max_responses is not None and num_already_done + saved_count >= max_responses:
                 break
@@ -393,7 +420,10 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
                 "num_tokens_generated": out["num_tokens_generated"],
                 "sample_time_s": round(sample_elapsed, 2),
                 "alpha": args.alpha,
+                "sampler": args.sampler,
             }
+            if "stats" in out:
+                result["smc_stats"] = out["stats"]
             if prob.get("difficulty") is not None:
                 result["difficulty"] = prob["difficulty"]
 
@@ -421,6 +451,8 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
                 }
             if max_responses is not None:
                 postfix["global"] = f"{global_saved}/{max_responses}"
+            if "stats" in out:
+                postfix["resamples"] = out["stats"].get("resample_count", 0)
             pbar.set_postfix(**postfix)
         pbar.close()
 
@@ -455,7 +487,10 @@ def generate(args):
         dataset_slug = f"synthetic_{stem}"
     else:
         dataset_slug = args.dataset
-    output_dir = os.path.join(args.output_dir, dataset_slug, model_slug, f"alpha_{args.alpha}")
+    alpha_slug = f"alpha_{args.alpha}"
+    if args.sampler == "power_smc":
+        alpha_slug = f"power_smc_{alpha_slug}"
+    output_dir = os.path.join(args.output_dir, dataset_slug, model_slug, alpha_slug)
     os.makedirs(output_dir, exist_ok=True)
 
     all_path = os.path.join(output_dir, "power_demos_all.jsonl")
@@ -660,6 +695,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # Power sampling
+    parser.add_argument("--sampler", type=str, default="power_sampling",
+                        choices=["power_sampling", "power_smc"],
+                        help="Generation algorithm to use")
+    parser.add_argument("--power_smc", action="store_const", const="power_smc",
+                        dest="sampler",
+                        help="Shortcut for --sampler power_smc")
     parser.add_argument("--alpha", type=float, default=4.0)
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--num_rollouts", type=int, default=8)
@@ -676,6 +717,35 @@ def main():
     parser.add_argument("--confidence_threshold", type=float, default=None,
                         help="Skip rollouts when top-1 vs top-2 gap exceeds this")
     parser.add_argument("--length_normalize", action="store_true")
+
+    # Power-SMC
+    parser.add_argument("--smc_particles", type=int, default=64,
+                        help="Number of Power-SMC particles")
+    parser.add_argument("--smc_ess_threshold", type=float, default=0.5,
+                        help="Resample when ESS drops below this fraction of particles")
+    parser.add_argument("--smc_block_size", type=int, default=64,
+                        help="Check ESS every N generated tokens")
+    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100,
+                        help="Linearly ramp alpha over the first N generated tokens")
+    parser.add_argument("--smc_temperature", type=float, default=None,
+                        help="Fixed Power-SMC proposal temperature. Defaults to adaptive 1/alpha_t")
+    parser.add_argument("--smc_min_new_tokens", type=int, default=0,
+                        help="Suppress EOS for this many generated tokens")
+    parser.add_argument("--smc_top_k", type=int, default=0,
+                        help="Top-k truncation for the Power-SMC proposal; 0 disables it")
+    parser.add_argument("--smc_top_p", type=float, default=1.0,
+                        help="Nucleus truncation for the Power-SMC proposal; 1.0 disables it")
+    parser.add_argument("--smc_repetition_penalty", type=float, default=1.0,
+                        help="Repetition penalty for the Power-SMC proposal")
+    parser.add_argument("--no_smc_stop_on_boxed", action="store_true",
+                        help="Do not stop Power-SMC particles after a non-empty boxed answer")
+    parser.add_argument("--no_smc_cow_cache", action="store_true",
+                        help="Disable copy-on-write cache compression after SMC resampling")
+    parser.add_argument("--no_smc_shared_prompt_cache", action="store_true",
+                        help="Process the prompt separately for every SMC particle")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                        choices=["float16", "bfloat16", "float32", "auto"],
+                        help="Model dtype")
 
     # vLLM / parallelism
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
