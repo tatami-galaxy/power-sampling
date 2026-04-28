@@ -277,17 +277,17 @@ def _has_nonempty_boxed(text: str) -> bool:
 
 @dataclass
 class PowerSMCConfig:
-    max_new_tokens: int = 2048
-    alpha: float = 4.0
-    n_particles: int = 64
+    max_new_tokens: int = 3072
+    alpha: float = 2.0
+    n_particles: int = 32
     ess_threshold: float = 0.5
     proposal_temperature: float | None = None
-    block_size: int = 64
-    alpha_ramp_tokens: int = 100
-    min_new_tokens: int = 0
+    block_size: int = 128
+    alpha_ramp_tokens: int = 400
+    min_new_tokens: int = 100
     repetition_penalty: float = 1.0
     top_k: int = 0
-    top_p: float = 1.0
+    top_p: float = 0.9
     min_tokens_to_keep: int = 1
     penalize_prompt: bool = False
     hard_truncation: bool = True

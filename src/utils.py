@@ -1,31 +1,30 @@
 import re
+
+import sympy
+from pylatexenc import latex2text
+from sympy.parsing import sympy_parser
 from datasets import load_dataset
-from math_verify import parse, verify
-from math_verify.parser import (
-    ExprExtractionConfig,
-    LatexExtractionConfig,
-)
 
 # ---------------------------------------------------------------------------
-# Answer extraction and equivalence checking
+# Answer extraction
 # ---------------------------------------------------------------------------
 
-PRED_EXTRACTION_CONFIG = [
-    LatexExtractionConfig(boxed_match_priority=0),
-    ExprExtractionConfig(),
-]
-GOLD_EXTRACTION_CONFIG = [
-    LatexExtractionConfig(),
-    ExprExtractionConfig(),
-]
+
+def _remove_boxed(s: str) -> str | None:
+    """Strip a leading \\boxed{...} wrapper and return inner content."""
+    left = "\\boxed{"
+    try:
+        assert s[: len(left)] == left
+        assert s[-1] == "}"
+        return s[len(left) : -1]
+    except Exception:
+        return None
 
 
 def extract_boxed_answer(text: str) -> str | None:
     """Extract the rightmost non-empty \\boxed{...} or \\fbox{...} answer.
 
-    This mirrors the Power-SMC extractor behavior: search both box macros
-    together from right to left, handle nested braces, and skip empty template
-    boxes like ``\\boxed{}`` or ``\\boxed{{}}``.
+    Searches right-to-left so we skip placeholder boxes like ``\\boxed{{}}``.
     """
     candidates = []
     for macro in ("\\boxed", "\\fbox"):
@@ -34,286 +33,403 @@ def extract_boxed_answer(text: str) -> str | None:
             idx = text.find(macro, start)
             if idx < 0:
                 break
-            candidates.append((idx, macro))
-            start = idx + len(macro)
+            candidates.append(idx)
+            start = idx + 1
 
-    for idx, macro in sorted(candidates, reverse=True):
-        brace_idx = idx + len(macro)
-        while brace_idx < len(text) and text[brace_idx].isspace():
-            brace_idx += 1
-        if brace_idx >= len(text) or text[brace_idx] != "{":
+    if not candidates:
+        return None
+
+    for idx in sorted(candidates, reverse=True):
+        i = idx
+        while i < len(text) and text[i] != "{":
+            i += 1
+        if i >= len(text):
             continue
 
-        depth = 0
-        right = None
-        for pos in range(brace_idx, len(text)):
-            if text[pos] == "{":
-                depth += 1
-            elif text[pos] == "}":
-                depth -= 1
-                if depth == 0:
-                    right = pos
+        right_brace_idx = None
+        num_left_braces_open = 0
+        j = i
+        while j < len(text):
+            if text[j] == "{":
+                num_left_braces_open += 1
+            if text[j] == "}":
+                num_left_braces_open -= 1
+                if num_left_braces_open == 0:
+                    right_brace_idx = j
                     break
+            j += 1
 
-        if right is None:
+        if right_brace_idx is None:
             continue
 
-        content = text[brace_idx + 1 : right].strip()
-        while len(content) >= 2 and content[0] == "{" and content[-1] == "}":
-            inner = content[1:-1].strip()
-            if inner == content:
-                break
-            content = inner
-        if content and content.replace("{", "").replace("}", "").strip():
-            return content
+        retval = text[idx : right_brace_idx + 1]
+        content = _remove_boxed(retval) if retval.startswith("\\boxed{") else retval
+
+        if (
+            content is not None
+            and content.strip().replace("{", "").replace("}", "").strip() != ""
+        ):
+            return _remove_boxed(retval) if retval.startswith("\\boxed{") else content
 
     return None
 
 
 # ---------------------------------------------------------------------------
-# Normalization helpers (ported from Hendrycks MATH / reasoning-with-sampling)
+# Hendrycks MATH normalization (from math_normalize.py in Power-SMC)
 # ---------------------------------------------------------------------------
 
-_UNITS_RE = re.compile(
-    r"(?:degree|cm|centimeter|meter|mile|second|minute|hour|day|week|month|year"
-    r"|foot|feet|inch|yard)(es|s)? *(\^[0-9]+)?",
-)
+
+def _fix_fracs(string):
+    substrs = string.split("\\frac")
+    new_str = substrs[0]
+    if len(substrs) > 1:
+        substrs = substrs[1:]
+        for substr in substrs:
+            new_str += "\\frac"
+            if substr[0] == "{":
+                new_str += substr
+            else:
+                try:
+                    assert len(substr) >= 2
+                except Exception:
+                    return string
+                a = substr[0]
+                b = substr[1]
+                if b != "{":
+                    if len(substr) > 2:
+                        post_substr = substr[2:]
+                        new_str += "{" + a + "}{" + b + "}" + post_substr
+                    else:
+                        new_str += "{" + a + "}{" + b + "}"
+                else:
+                    if len(substr) > 2:
+                        post_substr = substr[2:]
+                        new_str += "{" + a + "}" + b + post_substr
+                    else:
+                        new_str += "{" + a + "}" + b
+        string = new_str
+    return string
 
 
-def _fix_fracs(s: str) -> str:
-    r"""\\frac12 -> \\frac{1}{2}, etc."""
-    parts = s.split("\\frac")
-    if len(parts) < 2:
-        return s
-    out = parts[0]
-    for part in parts[1:]:
-        out += "\\frac"
-        if not part or part[0] == "{":
-            out += part
-            continue
-        if len(part) < 2:
-            out += part
-            continue
-        a, b = part[0], part[1]
-        if b != "{":
-            out += "{" + a + "}{" + b + "}" + part[2:]
+def _fix_a_slash_b(string):
+    if len(string.split("/")) != 2:
+        return string
+    a = string.split("/")[0]
+    b = string.split("/")[1]
+    try:
+        a = int(a)
+        b = int(b)
+        assert string == "{}/{}".format(a, b)
+        new_string = "\\frac{" + str(a) + "}{" + str(b) + "}"
+        return new_string
+    except Exception:
+        return string
+
+
+def _remove_right_units(string):
+    if "\\text{ " in string:
+        splits = string.split("\\text{ ")
+        assert len(splits) == 2
+        return splits[0]
+    else:
+        return string
+
+
+def _fix_sqrt(string):
+    if "\\sqrt" not in string:
+        return string
+    splits = string.split("\\sqrt")
+    new_string = splits[0]
+    for split in splits[1:]:
+        if split[0] != "{":
+            a = split[0]
+            new_substr = "\\sqrt{" + a + "}" + split[1:]
         else:
-            out += "{" + a + "}" + b + part[2:]
-    return out
+            new_substr = "\\sqrt" + split
+        new_string += new_substr
+    return new_string
 
 
-def _fix_sqrt(s: str) -> str:
-    r"""\\sqrt3 -> \\sqrt{3}."""
-    parts = s.split("\\sqrt")
-    if len(parts) < 2:
-        return s
-    out = parts[0]
-    for part in parts[1:]:
-        if not part or part[0] == "{":
-            out += "\\sqrt" + part
-        else:
-            out += "\\sqrt{" + part[0] + "}" + part[1:]
-    return out
+def _strip_string(string):
+    string = string.replace("\n", "")
+    string = string.replace("\\!", "")
+    string = string.replace("\\\\", "\\")
+    string = string.replace("tfrac", "frac")
+    string = string.replace("dfrac", "frac")
+    string = string.replace("\\left", "")
+    string = string.replace("\\right", "")
+    string = string.replace("^{\\circ}", "")
+    string = string.replace("^\\circ", "")
+    string = string.replace("\\$", "")
+    string = _remove_right_units(string)
+    string = string.replace("\\%", "")
+    string = string.replace(r"\%", "")
+    string = string.replace(" .", " 0.")
+    string = string.replace("{.", "{0.")
+    if len(string) == 0:
+        return string
+    if string[0] == ".":
+        string = "0" + string
+    if len(string.split("=")) == 2:
+        if len(string.split("=")[0]) <= 2:
+            string = string.split("=")[1]
+    string = _fix_sqrt(string)
+    string = string.replace(" ", "")
+    string = _fix_fracs(string)
+    if string == "0.5":
+        string = "\\frac{1}{2}"
+    string = _fix_a_slash_b(string)
+    return string
 
 
-def _fix_a_slash_b(s: str) -> str:
-    r"""Simple a/b -> \\frac{a}{b} when both are integers."""
-    pieces = s.split("/")
-    if len(pieces) != 2:
-        return s
+def _normalize_hendrycks(answer: str | None) -> str | None:
+    """Hendrycks MATH normalization (math_equivalence)."""
+    if answer is None:
+        return None
+    answer = answer.strip()
     try:
-        a, b = int(pieces[0]), int(pieces[1])
-        return f"\\frac{{{a}}}{{{b}}}"
-    except ValueError:
-        return s
+        m = re.search(r"^\\\\text\{(?P<text>.+?)\}$", answer)
+        if m is not None:
+            answer = m.group("text").strip()
+        return _strip_string(answer)
+    except Exception:
+        return answer
 
 
-def _strip_commas(s: str) -> str:
-    """Remove properly-formatted thousands commas: 1,000,000 -> 1000000."""
-    p = re.compile(r"(\d),(\d\d\d)(?=$|\D)")
-    while True:
-        new = p.sub(r"\1\2", s)
-        if new == s:
-            break
-        s = new
-    return s
+# ---------------------------------------------------------------------------
+# Grader normalization + sympy equivalence (from math_grader.py in Power-SMC)
+# ---------------------------------------------------------------------------
+
+BAD_SUBSTRINGS = ["^{", "^("]
+BAD_REGEXES = [r"\^[0-9]+\^", r"\^[0-9][0-9]+"]
+TUPLE_CHARS = "()[]"
 
 
-def _normalize(s: str) -> str:
-    """Normalize a math answer string for string comparison."""
-    s = s.strip()
+def _sympy_parse(expr: str):
+    py_expr = expr.replace("^", "**")
+    return sympy_parser.parse_expr(
+        py_expr,
+        transformations=(
+            sympy_parser.standard_transformations
+            + (sympy_parser.implicit_multiplication_application,)
+        ),
+    )
 
-    # Remove dollar signs
-    s = s.replace("\\$", "")
-    if s.startswith("$") and s.endswith("$"):
-        s = s[1:-1]
-    s = s.replace("$", "")
 
-    # Remove percentage
-    s = s.replace("\\%", "").replace("%", "")
+def _parse_latex(expr: str) -> str:
+    expr = expr.replace("\\tfrac", "\\frac")
+    expr = expr.replace("\\dfrac", "\\frac")
+    expr = expr.replace("\\frac", " \\frac")
+    expr = latex2text.LatexNodes2Text().latex_to_text(expr)
+    expr = expr.replace("√", "sqrt")
+    expr = expr.replace("π", "pi")
+    expr = expr.replace("∞", "inf")
+    expr = expr.replace("∪", "U")
+    expr = expr.replace("·", "*")
+    expr = expr.replace("×", "*")
+    return expr.strip()
 
-    # Remove \text{} wrapper
-    m = re.fullmatch(r"\\text\{(.+)\}", s)
-    if m:
-        s = m.group(1).strip()
 
-    # Linebreaks and double backslash
-    s = s.replace("\n", "")
-    s = s.replace("\\\\", "\\")
-
-    # Frac variants -> \frac
-    s = s.replace("tfrac", "frac")
-    s = s.replace("dfrac", "frac")
-
-    # Remove display commands
-    s = s.replace("\\left", "").replace("\\right", "")
-    s = s.replace("\\,", "").replace("\\;", "").replace("\\!", "")
-
-    # Remove degree markers
-    s = s.replace("^{\\circ}", "").replace("^\\circ", "")
-
-    # Remove units (including inside \text{})
-    s = re.sub(r"\\text\{\s*[^}]*\}", "", s)
-    s = _UNITS_RE.sub("", s)
-
-    # Strip outer braces {expr}
-    if len(s) > 1 and s[0] == "{" and s[-1] == "}":
-        s = s[1:-1]
-
-    # Leading zero: .5 -> 0.5
-    s = s.replace(" .", " 0.").replace("{.", "{0.")
-    if s.startswith("."):
-        s = "0" + s
-
-    # Variable prefix: "k = 5" -> "5"
-    if len(s.split("=")) == 2 and len(s.split("=")[0].strip()) <= 2:
-        s = s.split("=")[1]
-
-    # Fix shorthand: \frac12, \sqrt3
-    s = _fix_sqrt(s)
-    s = _fix_fracs(s)
-
-    # Thousands commas
-    s = _strip_commas(s)
-
-    # "or" / "and" → comma (so "2 or -2" matches "(2, -2)")
-    s = re.sub(r"\s+or\s+", ", ", s)
-    s = re.sub(r"\s+and\s+", ", ", s)
-
-    # Mixed numbers: "7 3/4" → "7+3/4"
-    s = re.sub(r"(\d)\s+(\d)", r"\1+\2", s)
-
-    # Remove all spaces
-    s = s.replace(" ", "")
-
-    # a/b -> \frac{a}{b} for simple integer fractions
-    s = _fix_a_slash_b(s)
-
-    # Normalize integer-valued floats: "2.0" → "2"
+def _is_float(num: str) -> bool:
     try:
-        v = float(s.replace(",", ""))
-        if v == int(v) and abs(v) < 1e15:
-            s = str(int(v))
-    except (ValueError, OverflowError):
-        pass
-
-    # Case-insensitive for text answers
-    s = s.lower()
-
-    s = s.rstrip(".")
-    return s
-
-
-def _try_parse_number(s: str) -> float | None:
-    """Try to parse a string as a number (int, float, or simple fraction)."""
-    s = s.replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    # a/b
-    m = re.fullmatch(r"(-?\d+)\s*/\s*(-?\d+)", s)
-    if m and int(m.group(2)) != 0:
-        return int(m.group(1)) / int(m.group(2))
-    # \frac{a}{b}
-    m = re.fullmatch(r"\\frac\{(-?\d+)\}\{(-?\d+)\}", s)
-    if m and int(m.group(2)) != 0:
-        return int(m.group(1)) / int(m.group(2))
-    # -\frac{a}{b}
-    m = re.fullmatch(r"-\\frac\{(\d+)\}\{(\d+)\}", s)
-    if m and int(m.group(2)) != 0:
-        return -int(m.group(1)) / int(m.group(2))
-    return None
-
-
-_TUPLE_CHARS = "()[]"
-
-
-def _split_tuple(s: str) -> list[str]:
-    """Split a tuple/interval like '(a, b)' into elements ['a', 'b'].
-
-    Returns a single-element list [s] if s is not a tuple.
-    """
-    s = _strip_commas(s)
-    if (
-        len(s) > 2
-        and s[0] in _TUPLE_CHARS
-        and s[-1] in _TUPLE_CHARS
-        and all(ch not in s[1:-1] for ch in _TUPLE_CHARS)
-    ):
-        return [e.strip() for e in s[1:-1].split(",")]
-    return [s]
-
-
-def _is_equiv_single(pred_n: str, gold_n: str, pred_raw: str, gold_raw: str) -> bool:
-    """Check equivalence of two scalar (non-tuple) normalized answers."""
-    if pred_n == gold_n:
+        float(num)
         return True
-    pred_v = _try_parse_number(pred_n)
-    gold_v = _try_parse_number(gold_n)
-    if pred_v is not None and gold_v is not None:
-        return abs(pred_v - gold_v) < 1e-6
+    except ValueError:
+        return False
+
+
+def _is_int(x: float) -> bool:
     try:
-        gold_parsed = parse(gold_raw, extraction_config=GOLD_EXTRACTION_CONFIG)
-        pred_parsed = parse(pred_raw, extraction_config=PRED_EXTRACTION_CONFIG)
-        return verify(gold_parsed, pred_parsed)
+        return abs(x - int(round(x))) <= 1e-7
     except Exception:
         return False
 
 
-def is_equiv(pred: str, gold: str) -> bool:
-    """Check equivalence using layered strategies:
-    1. Normalized string match (fast, handles most cases)
-    2. Tuple/interval element-wise comparison
-    3. Numeric comparison (fractions, decimals)
-    4. math_verify symbolic comparison (fallback for complex expressions)
-    """
-    pred_n = _normalize(pred)
-    gold_n = _normalize(gold)
+def _is_frac(expr: str) -> bool:
+    return bool(re.search(r"^-?[0-9]+.?/0*[1-9][0-9]*.?$", expr))
 
-    # Fast path: full normalized match
-    if pred_n == gold_n:
+
+def _str_is_int(x: str) -> bool:
+    try:
+        x = _strip_properly_formatted_commas(x)
+        x = float(x)
+        return abs(x - int(round(x))) <= 1e-7
+    except Exception:
+        return False
+
+
+def _str_to_int(x: str) -> int:
+    x = x.replace(",", "")
+    x = float(x)
+    return int(x)
+
+
+def _inject_implicit_mixed_number(step: str):
+    p1 = re.compile("([0-9]) +([0-9])")
+    step = p1.sub("\\1+\\2", step)
+    return step
+
+
+def _strip_properly_formatted_commas(expr: str):
+    p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
+    while True:
+        next_expr = p1.sub("\\1\\3\\4", expr)
+        if next_expr == expr:
+            break
+        expr = next_expr
+    return next_expr
+
+
+def _normalize_grader(expr: str) -> str | None:
+    """Secondary normalization from the Power-SMC math grader."""
+    if expr is None:
+        return None
+
+    m = re.search(r"^\\\\text\{(?P<text>.+?)\}$", expr)
+    if m is not None:
+        expr = m.group("text")
+
+    expr = expr.replace("\\%", "%")
+    expr = expr.replace("\\$", "$")
+    expr = expr.replace("$", "")
+    expr = expr.replace("%", "")
+    expr = expr.replace(" or ", " , ")
+    expr = expr.replace(" and ", " , ")
+
+    expr = expr.replace("million", "*10^6")
+    expr = expr.replace("billion", "*10^9")
+    expr = expr.replace("trillion", "*10^12")
+
+    for unit in [
+        "degree", "cm", "centimeter", "meter", "mile", "second", "minute",
+        "hour", "day", "week", "month", "year", "foot", "feet", "inch", "yard",
+    ]:
+        expr = re.sub(rf"{unit}(es)?(s)? *(\^[0-9]+)?", "", expr)
+    expr = re.sub(r"\^ *\\\\circ", "", expr)
+
+    if len(expr) > 0 and expr[0] == "{" and expr[-1] == "}":
+        expr = expr[1:-1]
+
+    expr = re.sub(",\\\\! *", "", expr)
+    if _is_float(expr) and _is_int(float(expr)):
+        expr = str(int(round(float(expr))))
+    if "\\" in expr:
+        try:
+            expr = _parse_latex(expr)
+        except Exception:
+            pass
+
+    expr = re.sub("- *", "-", expr)
+    expr = _inject_implicit_mixed_number(expr)
+    expr = expr.replace(" ", "")
+    expr = expr.replace("{", "")
+    expr = expr.replace("}", "")
+    expr = expr.lower()
+
+    if _str_is_int(expr):
+        expr = str(_str_to_int(expr))
+
+    return expr
+
+
+def _count_unknown_letters_in_expr(expr: str):
+    expr = expr.replace("sqrt", "")
+    expr = expr.replace("frac", "")
+    letters_in_expr = set([x for x in expr if x.isalpha()])
+    return len(letters_in_expr)
+
+
+def _should_allow_eval(expr: str):
+    if _count_unknown_letters_in_expr(expr) > 2:
+        return False
+    for bad_string in BAD_SUBSTRINGS:
+        if bad_string in expr:
+            return False
+    for bad_regex in BAD_REGEXES:
+        if re.search(bad_regex, expr) is not None:
+            return False
+    return True
+
+
+def _are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
+    are_equal = False
+    try:
+        expr = f"({ground_truth_normalized})-({given_normalized})"
+        if _should_allow_eval(expr):
+            sympy_diff = _sympy_parse(expr)
+            simplified = sympy.simplify(sympy_diff)
+            if simplified == 0:
+                are_equal = True
+    except Exception:
+        pass
+    return are_equal
+
+
+def _split_tuple(expr: str):
+    expr = _strip_properly_formatted_commas(expr)
+    if len(expr) == 0:
+        return []
+    if (
+        len(expr) > 2
+        and expr[0] in TUPLE_CHARS
+        and expr[-1] in TUPLE_CHARS
+        and all([ch not in expr[1:-1] for ch in TUPLE_CHARS])
+    ):
+        elems = [elem.strip() for elem in expr[1:-1].split(",")]
+    else:
+        elems = [expr]
+    return elems
+
+
+def is_equiv(pred: str, gold: str) -> bool:
+    """Check equivalence using the Power-SMC reference grader.
+
+    Two-tier normalization:
+    1. Hendrycks MATH normalization (fast string match)
+    2. Grader normalization + sympy simplification (fallback)
+    """
+    if pred is None:
+        return False
+
+    # Tier 1: Hendrycks normalization
+    gold_normalized_h = _normalize_hendrycks(gold)
+    pred_normalized_h = _normalize_hendrycks(pred)
+    if gold_normalized_h == pred_normalized_h:
         return True
 
-    # Split into tuple elements
-    pred_elems = _split_tuple(pred_n)
-    gold_elems = _split_tuple(gold_n)
+    # Tier 2: Grader normalization + sympy
+    gold_normalized = _normalize_grader(gold)
+    pred_normalized = _normalize_grader(pred)
 
-    if len(pred_elems) != len(gold_elems):
-        # Length mismatch — fall through to single-value comparison
-        return _is_equiv_single(pred_n, gold_n, pred, gold)
+    if gold_normalized is None:
+        return False
+    if gold_normalized == pred_normalized:
+        return True
+    if len(pred_normalized) == 0:
+        return False
 
-    if len(pred_elems) > 1:
-        # Tuple: require matching delimiters
-        if pred_n[0] != gold_n[0] or pred_n[-1] != gold_n[-1]:
-            return False
-        return all(
-            _is_equiv_single(pe, ge, pe, ge)
-            for pe, ge in zip(pred_elems, gold_elems)
-        )
+    gold_elems = _split_tuple(gold_normalized)
+    pred_elems = _split_tuple(pred_normalized)
 
-    # Scalar: full comparison with raw strings for math_verify fallback
-    return _is_equiv_single(pred_n, gold_n, pred, gold)
+    if len(gold_elems) > 1 and (
+        gold_normalized[0] != pred_normalized[0]
+        or gold_normalized[-1] != pred_normalized[-1]
+    ):
+        return False
+    elif len(gold_elems) != len(pred_elems):
+        return False
+    else:
+        for gold_elem, pred_elem in zip(gold_elems, pred_elems):
+            if _is_frac(gold_elem) and _is_frac(pred_elem):
+                if gold_elem != pred_elem:
+                    return False
+            elif _str_is_int(gold_elem) != _str_is_int(pred_elem):
+                return False
+            else:
+                if not _are_equal_under_sympy(gold_elem, pred_elem):
+                    return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------

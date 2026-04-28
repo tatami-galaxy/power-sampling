@@ -235,7 +235,6 @@ def evaluate_model_power_smc(
     alpha: float = 4.0,
     n_particles: int = 64,
     ess_threshold: float = 0.5,
-    proposal_temperature: float | None = None,
     block_size: int = 64,
     alpha_ramp_tokens: int = 100,
     min_new_tokens: int = 0,
@@ -255,9 +254,7 @@ def evaluate_model_power_smc(
     from tqdm import tqdm
 
     method = "power_smc"
-    effective_temperature = proposal_temperature
-    if effective_temperature is None:
-        effective_temperature = 1.0 / alpha
+    temperature = 1.0 / alpha
 
     print(f"\n{'='*60}")
     print(f"Evaluating ({method}): {model_name}")
@@ -267,7 +264,7 @@ def evaluate_model_power_smc(
     )
     print(
         f"  block_size={block_size}, alpha_ramp_tokens={alpha_ramp_tokens}, "
-        f"proposal_temperature={effective_temperature:.4f}"
+        f"temperature={temperature:.4f}"
     )
     print(f"Problems: {len(problems)}")
     print(f"{'='*60}")
@@ -277,7 +274,7 @@ def evaluate_model_power_smc(
         alpha=alpha,
         n_particles=n_particles,
         ess_threshold=ess_threshold,
-        proposal_temperature=proposal_temperature,
+        proposal_temperature=temperature,
         block_size=block_size,
         alpha_ramp_tokens=alpha_ramp_tokens,
         max_new_tokens=max_tokens,
@@ -343,8 +340,7 @@ def evaluate_model_power_smc(
         "alpha": alpha,
         "n_particles": n_particles,
         "ess_threshold": ess_threshold,
-        "proposal_temperature": proposal_temperature,
-        "effective_proposal_temperature": effective_temperature,
+        "temperature": temperature,
         "block_size": block_size,
         "alpha_ramp_tokens": alpha_ramp_tokens,
         "min_new_tokens": min_new_tokens,
@@ -595,15 +591,13 @@ def main():
                         help="Resample when ESS drops below this fraction of particles")
     parser.add_argument("--smc_block_size", type=int, default=64,
                         help="Check ESS every N generated tokens")
-    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100,
+    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=400,
                         help="Linearly ramp alpha over the first N generated tokens")
-    parser.add_argument("--smc_temperature", type=float, default=None,
-                        help="Fixed Power-SMC proposal temperature. Defaults to 1/alpha")
-    parser.add_argument("--smc_min_new_tokens", type=int, default=0,
+    parser.add_argument("--smc_min_new_tokens", type=int, default=100,
                         help="Suppress EOS for this many generated tokens")
     parser.add_argument("--smc_top_k", type=int, default=0,
                         help="Top-k truncation for the Power-SMC proposal; 0 disables it")
-    parser.add_argument("--smc_top_p", type=float, default=1.0,
+    parser.add_argument("--smc_top_p", type=float, default=0.9,
                         help="Nucleus truncation for the Power-SMC proposal; 1.0 disables it")
     parser.add_argument("--smc_repetition_penalty", type=float, default=1.0,
                         help="Repetition penalty for the Power-SMC proposal")
@@ -697,7 +691,6 @@ def main():
                 alpha=args.alpha,
                 n_particles=args.smc_particles,
                 ess_threshold=args.smc_ess_threshold,
-                proposal_temperature=args.smc_temperature,
                 block_size=args.smc_block_size,
                 alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
                 min_new_tokens=args.smc_min_new_tokens,
