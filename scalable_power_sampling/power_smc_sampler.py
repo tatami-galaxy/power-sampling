@@ -583,14 +583,14 @@ class HFPowerSMCSampler:
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         model_kwargs: dict[str, Any] = {
             "torch_dtype": _torch_dtype(dtype),
-            "trust_remote_code": True,
+            "trust_remote_code": False,
         }
         if max_model_len is not None:
             model_kwargs["max_position_embeddings"] = max_model_len
