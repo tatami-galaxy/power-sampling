@@ -211,6 +211,86 @@ def generate_power_sampling(
     return responses
 
 
+def generate_power_smc(
+    model_name: str,
+    problems: list[dict],
+    alpha: float = 4.0,
+    n_particles: int = 64,
+    ess_threshold: float = 0.5,
+    proposal_temperature: float | None = None,
+    block_size: int = 64,
+    alpha_ramp_tokens: int = 100,
+    min_new_tokens: int = 0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    repetition_penalty: float = 1.0,
+    max_tokens: int = 1024,
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 4096,
+    chat_template_model: str | None = None,
+    dtype: str = "bfloat16",
+    stop_on_boxed: bool = False,
+    use_cow_cache: bool = True,
+    shared_prompt_cache: bool = True,
+) -> list[str]:
+    from scalable_power_sampling import HFPowerSMCSampler
+
+    sampler = HFPowerSMCSampler(
+        model_name=model_name,
+        alpha=alpha,
+        n_particles=n_particles,
+        ess_threshold=ess_threshold,
+        proposal_temperature=proposal_temperature,
+        block_size=block_size,
+        alpha_ramp_tokens=alpha_ramp_tokens,
+        max_new_tokens=max_tokens,
+        min_new_tokens=min_new_tokens,
+        repetition_penalty=repetition_penalty,
+        top_k=top_k,
+        top_p=top_p,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        dtype=dtype,
+        stop_on_boxed=stop_on_boxed,
+        use_cow_cache=use_cow_cache,
+        shared_prompt_cache=shared_prompt_cache,
+    )
+    tokenizer = sampler.tokenizer
+
+    template_tok = tokenizer
+    if chat_template_model:
+        from transformers import AutoTokenizer
+        template_tok = AutoTokenizer.from_pretrained(
+            chat_template_model, trust_remote_code=True
+        )
+
+    responses = []
+    t0 = time.time()
+    pbar = tqdm(problems, desc="power_smc", unit="problem")
+    for prob in pbar:
+        messages = format_prompt(prob["prompt"])
+        text = template_tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        input_ids = tokenizer.encode(text)
+
+        sample_t0 = time.time()
+        out = sampler.generate(input_ids=input_ids, verbose=False)
+        sample_elapsed = time.time() - sample_t0
+        stats = out.get("stats", {})
+
+        responses.append(out["text"])
+        pbar.set_postfix(
+            tokens=out["num_tokens_generated"],
+            resamples=stats.get("resample_count", 0),
+            time=f"{sample_elapsed:.1f}s",
+        )
+
+    elapsed = time.time() - t0
+    print(f"Power-SMC: {len(problems)} problems in {elapsed:.1f}s")
+    return responses
+
+
 # ---------------------------------------------------------------------------
 # Scoring (official human_eval sandbox)
 # ---------------------------------------------------------------------------
@@ -347,6 +427,25 @@ def main():
     parser.add_argument("--use_jackknife", action="store_true",
                         help="Apply jackknife bias correction to power sampling (default: off)")
 
+    # Power-SMC
+    parser.add_argument("--power_smc", action="store_true")
+    parser.add_argument("--smc_particles", type=int, default=64)
+    parser.add_argument("--smc_ess_threshold", type=float, default=0.5)
+    parser.add_argument("--smc_block_size", type=int, default=64)
+    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100)
+    parser.add_argument("--smc_temperature", type=float, default=None,
+                        help="Fixed Power-SMC proposal temperature. Defaults to adaptive 1/alpha_t")
+    parser.add_argument("--smc_min_new_tokens", type=int, default=0)
+    parser.add_argument("--smc_top_k", type=int, default=0)
+    parser.add_argument("--smc_top_p", type=float, default=1.0)
+    parser.add_argument("--smc_repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--smc_stop_on_boxed", action="store_true",
+                        help="Stop Power-SMC particles after a boxed answer; off by default for code")
+    parser.add_argument("--no_smc_cow_cache", action="store_true")
+    parser.add_argument("--no_smc_shared_prompt_cache", action="store_true")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                        choices=["float16", "bfloat16", "float32", "auto"])
+
     args = parser.parse_args()
 
     # --- Load data ---
@@ -401,6 +500,37 @@ def main():
         save_results(output_dir, "power", power_scored)
         print_comparison(base_scored, power_scored)
 
+    # --- Power-SMC ---
+    smc_scored = None
+    if args.power_smc:
+        print(f"\n{'='*60}\nPower-SMC generation\n{'='*60}")
+        smc_responses = generate_power_smc(
+            model_name=args.model,
+            problems=problems,
+            alpha=args.alpha,
+            n_particles=args.smc_particles,
+            ess_threshold=args.smc_ess_threshold,
+            proposal_temperature=args.smc_temperature,
+            block_size=args.smc_block_size,
+            alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
+            min_new_tokens=args.smc_min_new_tokens,
+            top_k=args.smc_top_k,
+            top_p=args.smc_top_p,
+            repetition_penalty=args.smc_repetition_penalty,
+            max_tokens=args.max_tokens,
+            tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+            chat_template_model=args.chat_template_model,
+            dtype=args.dtype,
+            stop_on_boxed=args.smc_stop_on_boxed,
+            use_cow_cache=not args.no_smc_cow_cache,
+            shared_prompt_cache=not args.no_smc_shared_prompt_cache,
+        )
+        smc_scored = score_completions(problems, smc_responses, timeout=args.timeout)
+        print_report("Power-SMC", smc_scored)
+        save_results(output_dir, "power_smc", smc_scored)
+        print_comparison(base_scored, smc_scored)
+
     # --- Summary ---
     summary = {
         "model": args.model,
@@ -419,6 +549,18 @@ def main():
             "batch_size": args.batch_size,
             "num_candidates": args.num_candidates,
             "pass@1": sum(r["passed"] for r in power_scored) / len(power_scored),
+        }
+    if smc_scored is not None:
+        summary["power_smc"] = {
+            "alpha": args.alpha,
+            "n_particles": args.smc_particles,
+            "ess_threshold": args.smc_ess_threshold,
+            "proposal_temperature": args.smc_temperature,
+            "block_size": args.smc_block_size,
+            "alpha_ramp_tokens": args.smc_alpha_ramp_tokens,
+            "top_k": args.smc_top_k,
+            "top_p": args.smc_top_p,
+            "pass@1": sum(r["passed"] for r in smc_scored) / len(smc_scored),
         }
 
     summary_path = os.path.join(output_dir, "humaneval_summary.json")
