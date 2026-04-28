@@ -36,12 +36,32 @@ SYSTEM_PROMPT = (
     "Put your final answer in \\boxed{}."
 )
 
+RAW_PROMPT = "Can you solve the following math problem? "
+RAW_COT = " Please reason step by step, and put your final answer within \\boxed{}."
 
-def format_prompt(problem: str) -> list[dict]:
+
+def format_prompt_chat(problem: str) -> list[dict]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": problem},
     ]
+
+
+def format_prompt_raw(problem: str) -> str:
+    return RAW_PROMPT + problem + RAW_COT
+
+
+def build_prompt(problem: str, prompt_mode: str, tokenizer, template_tok=None,
+                 enable_thinking=None) -> str:
+    """Build a prompt string from a problem, respecting prompt_mode."""
+    if prompt_mode == "raw":
+        return format_prompt_raw(problem)
+    messages = format_prompt_chat(problem)
+    tok = template_tok or tokenizer
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
+    return tok.apply_chat_template(messages, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +78,7 @@ def evaluate_model(
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
     dtype: str = "bfloat16",
+    prompt_mode: str = "chat",
 ) -> dict:
     """Run evaluation and return results dict."""
     print(f"\n{'='*60}")
@@ -83,14 +104,11 @@ def evaluate_model(
 
     # Build prompts
     template_tok = chat_template_tokenizer or tokenizer
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
     prompts = []
     for p in problems:
-        messages = format_prompt(p["problem"])
-        text = template_tok.apply_chat_template(messages, **template_kwargs)
-        prompts.append(text)
+        prompts.append(build_prompt(
+            p["problem"], prompt_mode, tokenizer, template_tok, enable_thinking,
+        ))
 
     # Generate
     t0 = time.time()
@@ -138,6 +156,7 @@ def evaluate_model_power_sampling(
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
     dtype: str = "bfloat16",
+    prompt_mode: str = "chat",
 ) -> dict:
     """Run evaluation using power sampling and return results dict."""
     import torch
@@ -173,15 +192,12 @@ def evaluate_model_power_sampling(
     t0 = time.time()
 
     template_tok = chat_template_tokenizer or tokenizer
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
     correct_so_far = 0
     pbar = tqdm(problems, desc=method, unit="problem")
     for i, prob in enumerate(pbar):
-        messages = format_prompt(prob["problem"])
-        prompt_text = template_tok.apply_chat_template(messages, **template_kwargs)
-
+        prompt_text = build_prompt(
+            prob["problem"], prompt_mode, tokenizer, template_tok, enable_thinking,
+        )
         input_ids = tokenizer.encode(prompt_text)
 
         sample_t0 = time.time()
@@ -249,6 +265,7 @@ def evaluate_model_power_smc(
     stop_on_boxed: bool = True,
     use_cow_cache: bool = True,
     shared_prompt_cache: bool = True,
+    prompt_mode: str = "chat",
 ) -> dict:
     """Run evaluation using Power-SMC and return results dict."""
     from tqdm import tqdm
@@ -295,15 +312,13 @@ def evaluate_model_power_smc(
     t0 = time.time()
 
     template_tok = chat_template_tokenizer or tokenizer
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        template_kwargs["enable_thinking"] = enable_thinking
 
     correct_so_far = 0
     pbar = tqdm(problems, desc=method, unit="problem")
     for i, prob in enumerate(pbar):
-        messages = format_prompt(prob["problem"])
-        prompt_text = template_tok.apply_chat_template(messages, **template_kwargs)
+        prompt_text = build_prompt(
+            prob["problem"], prompt_mode, tokenizer, template_tok, enable_thinking,
+        )
         input_ids = tokenizer.encode(prompt_text)
 
         sample_t0 = time.time()
@@ -544,6 +559,10 @@ def main():
         help="Filter to specific MATH difficulty levels (1-5)",
     )
     parser.add_argument("--output_dir", default="results")
+    parser.add_argument("--prompt_mode", type=str, default="chat",
+                        choices=["chat", "raw"],
+                        help="Prompt format: 'chat' uses system+user chat template, "
+                             "'raw' uses plain CoT string (matches Power-SMC reference for base models)")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
@@ -653,6 +672,7 @@ def main():
             chat_template_tokenizer=chat_template_tokenizer,
             enable_thinking=args.enable_thinking,
             dtype=args.dtype,
+            prompt_mode=args.prompt_mode,
         )
         print_report(eval_output)
         save_results(eval_output, output_dir)
@@ -676,6 +696,7 @@ def main():
                 chat_template_tokenizer=chat_template_tokenizer,
                 enable_thinking=args.enable_thinking,
                 dtype=args.dtype,
+                prompt_mode=args.prompt_mode,
             )
             print_report(ps_output)
             ps_dir = output_dir + "/" + ps_output["method"]
@@ -704,6 +725,7 @@ def main():
                 dtype=args.dtype,
                 stop_on_boxed=not args.no_smc_stop_on_boxed,
                 use_cow_cache=not args.no_smc_cow_cache,
+                prompt_mode=args.prompt_mode,
                 shared_prompt_cache=not args.no_smc_shared_prompt_cache,
             )
             print_report(smc_output)
