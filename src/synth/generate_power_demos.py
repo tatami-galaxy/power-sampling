@@ -70,6 +70,22 @@ SYSTEM_PROMPT = (
     "Put your final answer in \\boxed{}."
 )
 
+RAW_PROMPT = "Can you solve the following math problem? "
+RAW_COT = " Please reason step by step, and put your final answer within \\boxed{}."
+
+
+def build_prompt(problem: str, prompt_mode: str, tokenizer) -> str:
+    """Build a prompt string from a problem, respecting prompt_mode."""
+    if prompt_mode == "raw":
+        return RAW_PROMPT + problem + RAW_COT
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem},
+    ]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
 
 # ---------------------------------------------------------------------------
 # GPU detection (no CUDA init — safe to call before spawn)
@@ -201,7 +217,7 @@ def _build_sampler(args):
             alpha=args.alpha,
             n_particles=args.smc_particles,
             ess_threshold=args.smc_ess_threshold,
-            proposal_temperature=args.smc_temperature,
+            proposal_temperature=1.0 / args.alpha,
             block_size=args.smc_block_size,
             alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
             max_new_tokens=args.max_tokens,
@@ -285,13 +301,7 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
                     if counter.value >= max_responses:
                         break
 
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prob["problem"]},
-            ]
-            prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            prompt_text = build_prompt(prob["problem"], args.prompt_mode, tokenizer)
             input_ids = tokenizer.encode(prompt_text)
 
             sample_t0 = time.time()
@@ -389,13 +399,7 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
             if max_responses is not None and num_already_done + saved_count >= max_responses:
                 break
 
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prob["problem"]},
-            ]
-            prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            prompt_text = build_prompt(prob["problem"], args.prompt_mode, tokenizer)
             input_ids = tokenizer.encode(prompt_text)
 
             sample_t0 = time.time()
@@ -725,15 +729,13 @@ def main():
                         help="Resample when ESS drops below this fraction of particles")
     parser.add_argument("--smc_block_size", type=int, default=64,
                         help="Check ESS every N generated tokens")
-    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=100,
+    parser.add_argument("--smc_alpha_ramp_tokens", type=int, default=400,
                         help="Linearly ramp alpha over the first N generated tokens")
-    parser.add_argument("--smc_temperature", type=float, default=None,
-                        help="Fixed Power-SMC proposal temperature. Defaults to 1/alpha")
-    parser.add_argument("--smc_min_new_tokens", type=int, default=0,
+    parser.add_argument("--smc_min_new_tokens", type=int, default=100,
                         help="Suppress EOS for this many generated tokens")
     parser.add_argument("--smc_top_k", type=int, default=0,
                         help="Top-k truncation for the Power-SMC proposal; 0 disables it")
-    parser.add_argument("--smc_top_p", type=float, default=1.0,
+    parser.add_argument("--smc_top_p", type=float, default=0.9,
                         help="Nucleus truncation for the Power-SMC proposal; 1.0 disables it")
     parser.add_argument("--smc_repetition_penalty", type=float, default=1.0,
                         help="Repetition penalty for the Power-SMC proposal")
@@ -753,6 +755,12 @@ def main():
     parser.add_argument("--max_model_len", type=int, default=8192)
     parser.add_argument("--num_workers", type=int, default=None,
                         help="Number of parallel workers (default: auto = num_gpus // tensor_parallel_size)")
+
+    # Prompt
+    parser.add_argument("--prompt_mode", type=str, default="chat",
+                        choices=["chat", "raw"],
+                        help="Prompt format: 'chat' uses system+user chat template, "
+                             "'raw' uses plain CoT string (matches Power-SMC reference)")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="results/power_demos")
