@@ -698,13 +698,10 @@ def main():
                         help="Polaris difficulty filter (e.g. 1/8 2/8)")
     parser.add_argument("--seed", type=int, default=42)
 
-    # Power sampling
+    # Sampler
     parser.add_argument("--sampler", type=str, default="power_sampling",
                         choices=["power_sampling", "power_smc"],
-                        help="Generation algorithm to use")
-    parser.add_argument("--power_smc", action="store_const", const="power_smc",
-                        dest="sampler",
-                        help="Shortcut for --sampler power_smc")
+                        help="Generation algorithm: power_sampling (vLLM batched) or power_smc (particle filter)")
     parser.add_argument("--alpha", type=float, default=4.0)
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--num_rollouts", type=int, default=8)
