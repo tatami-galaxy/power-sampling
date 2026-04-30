@@ -710,7 +710,7 @@ def main():
                         help="Tokens per chunk (B)")
     parser.add_argument("--num_candidates", type=int, default=32,
                         help="Candidate chunks per step (L)")
-    parser.add_argument("--max_tokens", type=int, default=4096,
+    parser.add_argument("--max_tokens", type=int, default=2048,
                         help="Max tokens per generation")
     parser.add_argument("--max_responses", type=int, default=None,
                         help="Stop after this many saved rows globally (across all workers, "
