@@ -24,8 +24,7 @@ from src.utils import (
     is_equiv,
     DATASET_REGISTRY_EVAL,
 )
-from scalable_power_sampling import HFPowerSMCSampler, VLLMBatchedPowerSampler
-
+from scalable_power_sampling import HFPowerSMCSampler
 
 # ---------------------------------------------------------------------------
 # Prompt formatting
@@ -133,111 +132,6 @@ def evaluate_model(
 
     return {
         "model": model_name,
-        "results": results,
-        "elapsed_s": elapsed,
-        "max_tokens": max_tokens,
-    }
-
-
-def evaluate_model_power_sampling(
-    model_name: str,
-    problems: list[dict],
-    max_tokens: int = 2048,
-    alpha: float = 4.0,
-    top_k: int = 8,
-    num_rollouts: int = 8,
-    lookahead: int = 32,
-    batch_size: int = 8,
-    num_candidates: int = 32,
-    tensor_parallel_size: int = 1,
-    max_model_len: int = 4096,
-    use_jackknife: bool = False,
-    length_normalize: bool = False,
-    chat_template_tokenizer=None,
-    enable_thinking: bool | None = None,
-    dtype: str = "bfloat16",
-    prompt_mode: str = "chat",
-) -> dict:
-    """Run evaluation using power sampling and return results dict."""
-    import torch
-    from tqdm import tqdm
-
-    method = "power_sampling"
-
-    print(f"\n{'='*60}")
-    print(f"Evaluating ({method}): {model_name}")
-    print(f"  alpha={alpha}, K={top_k}, M={num_rollouts}, H={lookahead}")
-    print(f"  B={batch_size}, L={num_candidates}")
-    print(f"Problems: {len(problems)}")
-    print(f"{'='*60}")
-
-    sampler = VLLMBatchedPowerSampler(
-        model_name=model_name,
-        alpha=alpha,
-        batch_size=batch_size,
-        num_candidates=num_candidates,
-        top_k=top_k,
-        num_rollouts=num_rollouts,
-        lookahead=lookahead,
-        max_new_tokens=max_tokens,
-        tensor_parallel_size=tensor_parallel_size,
-        max_model_len=max_model_len,
-        use_jackknife=use_jackknife,
-        length_normalize=length_normalize,
-        dtype=dtype,
-    )
-    tokenizer = sampler.tokenizer
-
-    results = []
-    t0 = time.time()
-
-    template_tok = chat_template_tokenizer or tokenizer
-    correct_so_far = 0
-    pbar = tqdm(problems, desc=method, unit="problem")
-    for i, prob in enumerate(pbar):
-        prompt_text = build_prompt(
-            prob["problem"], prompt_mode, tokenizer, template_tok, enable_thinking,
-        )
-        input_ids = tokenizer.encode(prompt_text)
-
-        sample_t0 = time.time()
-        out = sampler.generate(input_ids=input_ids, verbose=False)
-        sample_elapsed = time.time() - sample_t0
-
-        response = out["text"]
-        pred_answer = extract_boxed_answer(response)
-        correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
-        correct_so_far += int(correct)
-
-        results.append({
-            **prob,
-            "response": response,
-            "pred_answer": pred_answer,
-            "correct": correct,
-            "num_tokens_generated": out["num_tokens_generated"],
-            "sample_time_s": sample_elapsed,
-        })
-
-        pbar.set_postfix(
-            acc=f"{correct_so_far}/{i+1}",
-            tokens=out["num_tokens_generated"],
-            time=f"{sample_elapsed:.1f}s",
-        )
-
-    elapsed = time.time() - t0
-    print(f"{method} took {elapsed:.1f}s total")
-
-    config = {
-        "alpha": alpha, "top_k": top_k,
-        "num_rollouts": num_rollouts, "lookahead": lookahead,
-    }
-    config["batch_size"] = batch_size
-    config["num_candidates"] = num_candidates
-
-    return {
-        "model": model_name,
-        "method": method,
-        "power_sampling_config": config,
         "results": results,
         "elapsed_s": elapsed,
         "max_tokens": max_tokens,
@@ -441,32 +335,6 @@ def print_report(eval_output: dict):
         print(f"\nExtraction failures (no \\boxed{{}}): {no_answer}/{total}")
 
 
-def print_comparison(baseline_output: dict, power_output: dict):
-    """Confusion matrix of correctness between baseline and power sampling.
-
-    Matches problems by the `problem` string so the two evals don't need to
-    be in the same order.
-    """
-    base = {r["problem"]: r["correct"] for r in baseline_output["results"]}
-    power = {r["problem"]: r["correct"] for r in power_output["results"]}
-    shared = set(base) & set(power)
-
-    both_right = sum(1 for p in shared if base[p] and power[p])
-    both_wrong = sum(1 for p in shared if not base[p] and not power[p])
-    base_wrong_power_right = sum(1 for p in shared if not base[p] and power[p])
-    base_right_power_wrong = sum(1 for p in shared if base[p] and not power[p])
-
-    print(f"\n{'='*60}")
-    print(f"Baseline vs {power_output.get('method', 'power')} ({len(shared)} shared problems)")
-    print(f"{'='*60}")
-    print(f"  Both correct:                 {both_right}")
-    print(f"  Both wrong:                   {both_wrong}")
-    print(f"  Baseline wrong -> Power right: {base_wrong_power_right}")
-    print(f"  Baseline right -> Power wrong: {base_right_power_wrong}")
-    print(f"  Net delta:                    {base_wrong_power_right - base_right_power_wrong:+d}")
-    print(f"{'='*60}")
-
-
 def save_results(eval_output: dict, output_dir: str):
     """Save full results and summary to disk."""
     os.makedirs(output_dir, exist_ok=True)
@@ -528,8 +396,6 @@ def save_results(eval_output: dict, output_dir: str):
             1 for r in results if r["pred_answer"] is None
         ),
     }
-    if "power_sampling_config" in eval_output:
-        summary["power_sampling_config"] = eval_output["power_sampling_config"]
     if "power_smc_config" in eval_output:
         summary["power_smc_config"] = eval_output["power_smc_config"]
     summary_path = os.path.join(output_dir, f"{model_slug}_summary.json")
@@ -579,31 +445,13 @@ def main():
                         default=None,
                         help="For models with a toggleable thinking mode (e.g. Qwen3): "
                             "pass --enable-thinking or --no-enable-thinking to override "
-                            "the template default. Leave unset to use the model default.")
-
-    # Power sampling options
-    parser.add_argument("--power_sampling", action="store_true",
-                        help="Also evaluate using power sampling on the same samples")
-    parser.add_argument("--alpha", type=float, default=4.0,
-                        help="Power exponent for power sampling")
-    parser.add_argument("--top_k", type=int, default=8,
-                        help="Top-K candidates per step for power sampling")
-    parser.add_argument("--num_rollouts", type=int, default=8,
-                        help="Rollouts per candidate for power sampling")
-    parser.add_argument("--lookahead", type=int, default=192,
-                        help="Rollout horizon in tokens for power sampling")
-    parser.add_argument("--batch_size", type=int, default=192,
-                        help="Tokens per chunk for batched power sampling (B)")
-    parser.add_argument("--num_candidates", type=int, default=32,
-                        help="Candidate chunks to generate per step for batched power sampling (L)")
-    parser.add_argument("--use_jackknife", action="store_true",
-                        help="Apply jackknife bias correction to power sampling (default: off)")
-    parser.add_argument("--length_normalize", action="store_true",
-                        help="Normalize cumulative log-probs by sequence length")
+                            "the template default. Leave unset to use the model default.") 
 
     # Power-SMC options
     parser.add_argument("--power_smc", action="store_true",
                         help="Also evaluate using Power-SMC on the same samples")
+    parser.add_argument("--alpha", type=float, default=4.0,
+                        help="Power exponent for power sampling")
     parser.add_argument("--smc_particles", type=int, default=64,
                         help="Number of Power-SMC particles")
     parser.add_argument("--smc_ess_threshold", type=float, default=0.5,
@@ -656,82 +504,54 @@ def main():
         )
         print(f"Using chat template from: {args.chat_template_model}")
 
-    # Evaluate each model
-    for model_name in args.model:
-        model_slug = model_name.replace("/", "_")
-        output_dir = args.output_dir+'/'+args.dataset+'/'+model_slug
+    # Evaluate model
+    model_slug = args.model.replace("/", "_")
+    output_dir = args.output_dir+'/'+args.dataset+'/'+model_slug
 
-        # Baseline (vLLM)
-        eval_output = evaluate_model(
-            model_name=model_name,
+    # Baseline (vLLM)
+    eval_output = evaluate_model(
+        model_name=args.model,
+        problems=problems,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        tensor_parallel_size=args.tensor_parallel_size,
+        max_model_len=args.max_model_len or None,
+        chat_template_tokenizer=chat_template_tokenizer,
+        enable_thinking=args.enable_thinking,
+        dtype=args.dtype,
+        prompt_mode=args.prompt_mode,
+    )
+    print_report(eval_output)
+    save_results(eval_output, output_dir)
+
+    # Power-SMC
+    if args.power_smc:
+        smc_output = evaluate_model_power_smc(
+            model_name=args.model,
             problems=problems,
             max_tokens=args.max_tokens,
-            temperature=args.temperature,
+            alpha=args.alpha,
+            n_particles=args.smc_particles,
+            ess_threshold=args.smc_ess_threshold,
+            block_size=args.smc_block_size,
+            alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
+            min_new_tokens=args.smc_min_new_tokens,
+            top_k=args.smc_top_k,
+            top_p=args.smc_top_p,
+            repetition_penalty=args.smc_repetition_penalty,
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len or None,
             chat_template_tokenizer=chat_template_tokenizer,
             enable_thinking=args.enable_thinking,
             dtype=args.dtype,
+            stop_on_boxed=not args.no_smc_stop_on_boxed,
+            use_cow_cache=not args.no_smc_cow_cache,
             prompt_mode=args.prompt_mode,
+            shared_prompt_cache=not args.no_smc_shared_prompt_cache,
         )
-        print_report(eval_output)
-        save_results(eval_output, output_dir)
-
-        # Power sampling
-        if args.power_sampling:
-            ps_output = evaluate_model_power_sampling(
-                model_name=model_name,
-                problems=problems,
-                max_tokens=args.max_tokens,
-                alpha=args.alpha,
-                top_k=args.top_k,
-                num_rollouts=args.num_rollouts,
-                lookahead=args.lookahead,
-                batch_size=args.batch_size,
-                num_candidates=args.num_candidates,
-                tensor_parallel_size=args.tensor_parallel_size,
-                max_model_len=args.max_model_len or None,
-                use_jackknife=args.use_jackknife,
-                length_normalize=args.length_normalize,
-                chat_template_tokenizer=chat_template_tokenizer,
-                enable_thinking=args.enable_thinking,
-                dtype=args.dtype,
-                prompt_mode=args.prompt_mode,
-            )
-            print_report(ps_output)
-            ps_dir = output_dir + "/" + ps_output["method"]
-            save_results(ps_output, ps_dir)
-            print_comparison(eval_output, ps_output)
-
-        # Power-SMC
-        if args.power_smc:
-            smc_output = evaluate_model_power_smc(
-                model_name=model_name,
-                problems=problems,
-                max_tokens=args.max_tokens,
-                alpha=args.alpha,
-                n_particles=args.smc_particles,
-                ess_threshold=args.smc_ess_threshold,
-                block_size=args.smc_block_size,
-                alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
-                min_new_tokens=args.smc_min_new_tokens,
-                top_k=args.smc_top_k,
-                top_p=args.smc_top_p,
-                repetition_penalty=args.smc_repetition_penalty,
-                tensor_parallel_size=args.tensor_parallel_size,
-                max_model_len=args.max_model_len or None,
-                chat_template_tokenizer=chat_template_tokenizer,
-                enable_thinking=args.enable_thinking,
-                dtype=args.dtype,
-                stop_on_boxed=not args.no_smc_stop_on_boxed,
-                use_cow_cache=not args.no_smc_cow_cache,
-                prompt_mode=args.prompt_mode,
-                shared_prompt_cache=not args.no_smc_shared_prompt_cache,
-            )
-            print_report(smc_output)
-            smc_dir = output_dir + "/" + smc_output["method"]
-            save_results(smc_output, smc_dir)
-            print_comparison(eval_output, smc_output)
+        print_report(smc_output)
+        smc_dir = output_dir + "/" + smc_output["method"]
+        save_results(smc_output, smc_dir)
 
 
 if __name__ == "__main__":
